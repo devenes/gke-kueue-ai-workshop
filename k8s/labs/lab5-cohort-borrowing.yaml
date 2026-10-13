@@ -1,0 +1,114 @@
+# k8s/labs/lab5-cohort-borrowing.yaml
+# 1. Team A Workload: High Priority (1000), requests 5 vCPU (3 vCPU nominal + 2 vCPU borrowed from team-b-cq)
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: team-a-cohort-borrower
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: team-a-queue
+    kueue.x-k8s.io/priority-class: high-prod-priority
+spec:
+  replicatedJobs:
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        parallelism: 2
+        completions: 2
+        template:
+          metadata:
+            annotations:
+              kueue.x-k8s.io/podset-preferred-topology: "workshop.ai/topology-block"
+          spec:
+            restartPolicy: Never
+            containers:
+            - name: pytorch
+              image: pytorch/torchserve:0.12.0-cpu
+              command:
+              - bash
+              - -c
+              - |
+                torchrun \
+                  --nnodes=2 \
+                  --nproc_per_node=1 \
+                  --node_rank=$JOB_COMPLETION_INDEX \
+                  --master_addr=team-a-cohort-borrower-workers-0-0.team-a-cohort-borrower \
+                  --master_port=29500 \
+                  /workspace/train.py
+              env:
+              - name: NODE_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: spec.nodeName
+              - name: EPOCHS
+                value: "50"
+              resources:
+                requests:
+                  cpu: "2500m"
+                  memory: "2Gi"
+              volumeMounts:
+              - name: script-vol
+                mountPath: /workspace
+            volumes:
+            - name: script-vol
+              configMap:
+                name: pytorch-ddp-script
+---
+# 2. Team B Workload: Low Priority (100), requests 2.5 vCPU within team-b-cq's 3 vCPU nominal quota.
+# Even with lower priority (100 < 1000), team-b-cq reclaims its lent quota (reclaimWithinCohort: Any)
+# and preempts 'team-a-cohort-borrower'!
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: team-b-reclaim-owner
+  namespace: team-b
+  labels:
+    kueue.x-k8s.io/queue-name: team-b-queue
+    kueue.x-k8s.io/priority-class: low-research-priority
+spec:
+  replicatedJobs:
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        template:
+          metadata:
+            annotations:
+              kueue.x-k8s.io/podset-preferred-topology: "workshop.ai/topology-block"
+          spec:
+            restartPolicy: Never
+            containers:
+            - name: pytorch
+              image: pytorch/torchserve:0.12.0-cpu
+              command:
+              - bash
+              - -c
+              - |
+                torchrun \
+                  --nnodes=1 \
+                  --nproc_per_node=1 \
+                  --node_rank=0 \
+                  --master_addr=127.0.0.1 \
+                  --master_port=29500 \
+                  /workspace/train.py
+              env:
+              - name: NODE_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: spec.nodeName
+              - name: EPOCHS
+                value: "4"
+              resources:
+                requests:
+                  cpu: "2500m"
+                  memory: "2Gi"
+              volumeMounts:
+              - name: script-vol
+                mountPath: /workspace
+            volumes:
+            - name: script-vol
+              configMap:
+                name: pytorch-ddp-script
