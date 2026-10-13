@@ -9,7 +9,7 @@ KUEUE_VERSION  ?= 0.16.2
 
 .DEFAULT_GOAL := help
 
-.PHONY: help infra-init infra-plan infra-up infra-down kubeconfig operators-install base-apply status lab1 lab2 lab3 lab4 lab5 lab6 lab7 lab8 lab9 labs-clean
+.PHONY: help infra-init infra-plan infra-up infra-down kubeconfig operators-install base-apply status preflight test-all lab1 lab2 lab3 lab4 lab5 lab6 lab7 lab8 lab9 labs-clean
 
 help: ## Show available workshop Make targets
 	@echo "================================================================================"
@@ -161,3 +161,9 @@ labs-clean: ## Delete all lab JobSets and LeaderWorkerSets in namespaces team-a 
 	kubectl delete jobsets,leaderworkersets --all -n team-b --ignore-not-found --wait=true
 	kubectl wait --for=delete pod --all -n team-a --timeout=60s 2>/dev/null || true
 	kubectl wait --for=delete pod --all -n team-b --timeout=60s 2>/dev/null || true
+
+preflight: ## Run 15-second pre-flight health check across nodes, operators, queues, CEL policy, and metrics
+	./scripts/preflight-check.sh
+
+test-all: ## Run end-to-end automated smoke test suite across all 9 hands-on labs
+	./scripts/smoke-test-all.sh
