@@ -68,7 +68,7 @@ metadata:
   name: high-prod-priority
 value: 1000
 ---
-# 6. ClusterQueue and LocalQueue
+# 6. Multi-Team Cohort ClusterQueues and LocalQueues (team-a & team-b in 'ai-org-cohort')
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
@@ -79,6 +79,8 @@ spec:
   preemption:
     reclaimWithinCohort: Any
     withinClusterQueue: LowerPriority
+    borrowWithinCohort:
+      policy: LowerPriority
   admissionChecksStrategy:
     admissionChecks:
     - name: spot-atomic-check
@@ -89,15 +91,49 @@ spec:
     - name: "on-demand-flavor"
       resources:
       - name: "cpu"
-        nominalQuota: "6"
+        nominalQuota: "3"
+        borrowingLimit: "3"
       - name: "memory"
-        nominalQuota: "16Gi"
+        nominalQuota: "8Gi"
+        borrowingLimit: "8Gi"
     - name: "spot-flavor"
       resources:
       - name: "cpu"
         nominalQuota: "9"
+        lendingLimit: "0"
       - name: "memory"
         nominalQuota: "24Gi"
+        lendingLimit: "0"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: team-b-cq
+spec:
+  namespaceSelector: {}
+  cohortName: "ai-org-cohort"
+  preemption:
+    reclaimWithinCohort: Any
+    withinClusterQueue: LowerPriority
+  resourceGroups:
+  - coveredResources: ["cpu", "memory"]
+    flavors:
+    - name: "on-demand-flavor"
+      resources:
+      - name: "cpu"
+        nominalQuota: "3"
+        borrowingLimit: "3"
+      - name: "memory"
+        nominalQuota: "8Gi"
+        borrowingLimit: "8Gi"
+    - name: "spot-flavor"
+      resources:
+      - name: "cpu"
+        nominalQuota: "0"
+        borrowingLimit: "0"
+      - name: "memory"
+        nominalQuota: "0"
+        borrowingLimit: "0"
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
@@ -106,3 +142,11 @@ metadata:
   namespace: team-a
 spec:
   clusterQueue: team-a-cq
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: team-b-queue
+  namespace: team-b
+spec:
+  clusterQueue: team-b-cq
