@@ -1,6 +1,6 @@
 # 05 — Speaker Demo Cheat Sheet & Live Presentation Runbook
 
-Use this **Two-Terminal Split-Screen Runbook** when delivering a live conference talk, customer workshop, or technical deep dive covering all 6 labs.
+Use this **Two-Terminal Split-Screen Runbook** when delivering a live conference talk, customer workshop, or technical deep dive covering all 9 labs.
 
 ---
 
@@ -98,36 +98,57 @@ make labs-clean
 
 ### Demo 5: Multi-Team Cohort Borrowing & Reclamation (`team-a` vs. `team-b`) (3 mins)
 ```bash
-# Starts team-a-cohort-borrower (5 vCPU, prio=1000), prints borrowed quota, then submits team-b-reclaim-owner (2.5 vCPU, prio=100)
 make lab5
-```
-**Speaker Talking Points:**
-- *"Look at the JSON printed by `make lab5`: `team-a-cq` is using `total: 5` vCPUs by **borrowing `2 vCPUs`** from `team-b-cq`, and its job has `high-prod-priority` (`1000`)."*
-- *"Now `team-b` submits a job in `team-b-queue` with `low-research-priority` (`100`). Even though `100 < 1000`, `team-b-cq` is reclaiming its own nominal quota (`reclaimWithinCohort: Any`)!"*
-- *"Look at the top pane: `team-a-cohort-borrower` is immediately evicted (`reason: InCohortReclamation`), `team-b-reclaim-owner` runs its 4 epochs, and then `team-a-cohort-borrower` automatically re-borrows the quota and resumes!"*
-
-```bash
 make labs-clean
 ```
+**Speaker Talking Points:**
+- *"`team-a-cq` is using `total: 5` vCPUs by **borrowing `2 vCPUs`** from `team-b-cq` with `high-prod-priority` (`1000`)."*
+- *"When `team-b` submits a job in `team-b-queue` with `low-research-priority` (`100`), `team-b-cq` reclaims its nominal quota (`reclaimWithinCohort: Any`), preempting `team-a` (`reason: InCohortReclamation`) despite `100 < 1000`!"*
 
 ---
 
 ### Demo 6: Multi-Pod Distributed Inference with `LeaderWorkerSet` & Cross-PodSet TAS (3 mins)
 ```bash
-# Deploy the 2-Pod (Leader + Worker) Tensor-Parallel LeaderWorkerSet
 make lab6
 kubectl wait --for=condition=Ready pod/lws-tas-infer-0 -n team-a --timeout=90s
-```
-**Speaker Talking Points:**
-- *"For multi-pod LLM inference, `LeaderWorkerSet` creates a Leader Pod (`lws-tas-infer-0`) and a Worker Pod (`lws-tas-infer-0-1`) as two separate PodSets."*
-- *"By combining `kueue.x-k8s.io/podset-group-name: lws-rack-group` with `kueue.x-k8s.io/podset-required-topology: workshop.ai/topology-rack`, Kueue co-locates **both** Leader and Worker onto the exact same physical rack node!"*
-
-```bash
-# Trigger a live Tensor-Parallel AllReduce inference request across Leader + Worker:
 kubectl exec -n team-a lws-tas-infer-0 -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8080/infer').read().decode())"
-
-# Show Leader and Worker Tensor-Parallel logs:
-kubectl logs -n team-a lws-tas-infer-0
-kubectl logs -n team-a lws-tas-infer-0-1
 make labs-clean
 ```
+**Speaker Talking Points:**
+- *"By combining `kueue.x-k8s.io/podset-group-name: lws-rack-group` with `kueue.x-k8s.io/podset-required-topology: workshop.ai/topology-rack`, Kueue co-locates **both** the LWS Leader PodSet and Worker PodSet onto the exact same physical rack node for sub-4ms Tensor-Parallel `AllReduce`!"*
+
+---
+
+### Demo 7: Stateful DDP Checkpointing & Zero-Goodput-Loss Preemption Resume (3 mins)
+```bash
+make lab7
+kubectl wait --for=condition=Completed jobset/urgent-checkpoint-preemptor -n team-a --timeout=120s
+kubectl wait --for=condition=Ready pod -l jobset.sigs.k8s.io/jobset-name=resumable-research-job -n team-a --timeout=90s
+kubectl logs -l jobset.sigs.k8s.io/jobset-name=resumable-research-job,batch.kubernetes.io/job-completion-index=0 -n team-a -f
+make labs-clean
+```
+**Speaker Talking Points:**
+- *"`resumable-research-job` saves atomic PyTorch checkpoints at the end of Epochs 1–4 before getting preempted by `urgent-checkpoint-preemptor`."*
+- *"When Kueue automatically re-admits `resumable-research-job`, look at the logs: `🔄 [RESUMED FROM CHECKPOINT] Found saved state at Epoch 4! Resuming training from Epoch 5/8 (Zero Goodput Lost!)` — it completes Epochs 5..8 without repeating a single completed epoch!"*
+
+---
+
+### Demo 8: CEL `ValidatingAdmissionPolicy` Governance & `max-exec-time-seconds` SLA (2 mins)
+```bash
+make lab8
+make labs-clean
+```
+**Speaker Talking Points:**
+- *"First, Step 8A submits `unlabeled-rogue-jobset` without a `kueue.x-k8s.io/queue-name` label — Kubernetes' native CEL `ValidatingAdmissionPolicy` rejects it immediately at the API server!"*
+- *"Next, Step 8B submits `sla-time-bounded-job` with `kueue.x-k8s.io/max-exec-time-seconds: 20`. After 20 seconds of runtime, Kueue automatically evicts and deactivates the runaway job (`DeactivatedDueToMaximumExecutionTimeExceeded`)."*
+
+---
+
+### Demo 9: Kueue Visibility API & Prometheus Metrics Observability (2 mins)
+```bash
+make lab9
+make labs-clean
+```
+**Speaker Talking Points:**
+- *"`obs-occupier-job` saturates `team-a-cq`. Then `obs-queued-low` (`priority=100`) is submitted first, followed 2 seconds later by `obs-queued-high` (`priority=1000`)."*
+- *"Querying Kueue's `v1beta2` Visibility API (`/pendingworkloads`) shows `obs-queued-high` jumped to `positionInClusterQueue: 0` ahead of `obs-queued-low` (`positionInClusterQueue: 1`), while Prometheus `:8443/metrics` reports `kueue_cluster_queue_resource_usage=5` and `kueue_pending_workloads=2`."*

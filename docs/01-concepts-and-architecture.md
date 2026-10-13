@@ -1,6 +1,6 @@
 # 01 — Concepts & Architecture: Cloud-Native AI/ML Batch & Inference Scheduling on GKE
 
-This guide covers the theoretical and architectural foundations of distributed AI/ML batch training and multi-pod inference scheduling on Kubernetes using **Kueue (`v1beta2`)**, **JobSet (`v1alpha2`)**, **LeaderWorkerSet (`v1`)**, **Topology Aware Scheduling (TAS)**, **Multi-Team Cohorts**, and **GKE Atomic `ProvisioningRequest`**.
+This guide covers the theoretical and architectural foundations of distributed AI/ML batch training and multi-pod inference scheduling on Kubernetes using **Kueue (`v1beta2`)**, **JobSet (`v1alpha2`)**, **LeaderWorkerSet (`v1`)**, **Topology Aware Scheduling (TAS)**, **Multi-Team Cohorts**, **GKE Atomic `ProvisioningRequest`**, **Stateful Checkpointing**, **CEL Admission Governance**, and **Kueue Observability**.
 
 ---
 
@@ -20,7 +20,7 @@ flowchart LR
 
     subgraph KUEUE_ARCH["Kueue + JobSet + LWS + GKE Autoscaler (Cloud-Native AI Platform)"]
         direction TB
-        KJ["JobSet / LWS Submitted\n(Suspended / Gated)"] --> WQ["Kueue ClusterQueue & Cohort\nGang Admission + Fair-Share Borrowing"]
+        KJ["JobSet / LWS Submitted\n(CEL Policy Verified & Gated)"] --> WQ["Kueue ClusterQueue & Cohort\nGang Admission + Fair-Share Borrowing"]
         WQ -->|"Fits in On-Demand?"| TAS["Topology Aware Scheduling\nCo-locates ranks on Rack/Block"]
         WQ -->|"Spills to Spot?"| PR["Atomic ProvisioningRequest\nScales 0 -> N nodes together"]
     end
@@ -73,6 +73,7 @@ classDiagram
     class Workload {
         +PodSet[] podSets
         +String priorityClassName
+        +Int32 maximumExecutionTimeSeconds
         +WorkloadStatus status
     }
 
@@ -128,7 +129,7 @@ flowchart TD
 ```
 
 - **`kueue.x-k8s.io/podset-required-topology`:** Strict constraint forcing all Pods (or grouped PodSets via `podset-group-name`) into a single topology domain (`workshop.ai/topology-rack` in **Lab 2** and **Lab 6**).
-- **`kueue.x-k8s.io/podset-preferred-topology`:** Best-effort packing that spans across racks within `workshop.ai/topology-block` when a single rack cannot fit the entire gang (**Lab 1**, **Lab 4**, **Lab 5**).
+- **`kueue.x-k8s.io/podset-preferred-topology`:** Best-effort packing that spans across racks within `workshop.ai/topology-block` when a single rack cannot fit the entire gang (**Lab 1**, **Lab 4**, **Lab 5**, **Lab 7**, **Lab 9**).
 
 ---
 
@@ -138,3 +139,21 @@ flowchart TD
 | :--- | :--- | :--- |
 | **GPU / TPU Clusters** | `queued-provisioning.gke.io` | GKE **Dynamic Workload Scheduler (DWS)** flex-start queuing for scarce accelerators. |
 | **CPU Workshop Cluster** | `best-effort-atomic-scale-up.autoscaling.x-k8s.io` | GKE **Cluster Autoscaler Atomic Scale-Up** (`autoscaling.x-k8s.io/v1`), providing the exact same `Kueue -> AdmissionCheck -> ProvisioningRequest -> Atomic Node Provisioning` lifecycle on CPU Spot VMs (**Lab 3**). |
+
+---
+
+## 6. Production Operations: Checkpointing, Governance & Observability (Labs 7–9)
+
+### Stateful DDP Checkpointing & Zero-Goodput-Loss Resume (**Lab 7**)
+Preemption (**Lab 4** & **Lab 5**) and Spot reclamation are only acceptable in production AI platforms if preempted training jobs **preserve their training progress ("Goodput")**. In [`k8s/base/pytorch-ddp-configmap.yaml`](../k8s/base/pytorch-ddp-configmap.yaml) (`train_checkpoint.py`), our distributed training loop implements:
+- **PID 1 Signal Propagation (`exec torchrun`):** Ensures Kubernetes `SIGTERM` during Kueue eviction reaches `torchrun` and its worker ranks immediately.
+- **Atomic Checkpoint Persistence (`os.replace`):** Persists `epoch`, `model_state_dict`, and `optimizer_state_dict` on all ranks after every epoch and upon `SIGTERM`.
+- **Cross-Rank Epoch Synchronization (`dist.all_reduce(..., ReduceOp.MAX)`):** On re-admission, workers synchronize the highest persisted epoch across nodes and resume directly from `synced_epoch + 1`.
+
+### Zero-Trust Queue Governance & Time-Bounded SLA Leases (**Lab 8**)
+1. **CEL `ValidatingAdmissionPolicy` (`require-kueue-queue-name`):** Without admission enforcement, a user could omit `kueue.x-k8s.io/queue-name` on a `JobSet` or `LeaderWorkerSet` and bypass Kueue's quota gates entirely. Our native Kubernetes `ValidatingAdmissionPolicy` in [`k8s/base/governance-policy.yaml`](../k8s/base/governance-policy.yaml) enforces at the API server level that every `JobSet` and `LeaderWorkerSet` in namespaces labeled `kueue-governance: "enforced"` must declare a non-empty `kueue.x-k8s.io/queue-name` label.
+2. **Maximum Execution Time SLA (`kueue.x-k8s.io/max-exec-time-seconds`):** Prevents zombie or runaway jobs from hoarding cluster capacity indefinitely. When a workload's cumulative admitted runtime exceeds `spec.maximumExecutionTimeSeconds`, Kueue automatically evicts and deactivates (`spec.active: false`) the workload with `reason: DeactivatedDueToMaximumExecutionTimeExceeded`.
+
+### Queue Visibility API & Prometheus Metrics (**Lab 9**)
+- **On-Demand Visibility API (`visibility.kueue.x-k8s.io/v1beta2`):** Exposes `/apis/visibility.kueue.x-k8s.io/v1beta2/namespaces/<ns>/localqueues/<lq>/pendingworkloads` and `/clusterqueues/<cq>/pendingworkloads` so tenants and platform dashboards can inspect exact queue positions (`positionInClusterQueue`, `positionInLocalQueue`) in real time.
+- **Prometheus Metrics (`:8443/metrics`):** With `enableClusterQueueResources: true` enabled in `kueue-manager-config`, Kueue exports `kueue_pending_workloads`, `kueue_admitted_workloads_total`, `kueue_evicted_workloads_total`, `kueue_cluster_queue_nominal_quota`, and `kueue_cluster_queue_resource_usage`.

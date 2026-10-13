@@ -1,6 +1,6 @@
 # 02 — Infrastructure & Capacity Math: Terraform & GKE Design
 
-This document details the infrastructure design in [`terraform/`](../terraform/) and the capacity engineering math behind our GKE node pools, multi-team cohort quotas, and lab resource requests.
+This document details the infrastructure design in [`terraform/`](../terraform/) and the capacity engineering math behind our GKE node pools, multi-team cohort quotas, and lab resource requests across Labs 1–9.
 
 ---
 
@@ -11,7 +11,7 @@ This repository enforces a strict **two-layer architecture**:
 | Layer | Directory / Tooling | Provider / Mechanism | Scope |
 | :--- | :--- | :--- | :--- |
 | **Layer 1: Cloud Infrastructure** | [`terraform/`](../terraform/) | **100% `hashicorp/google` (`~> 6.0`)** | GCP APIs, Custom VPC, Secondary Subnets, Node IAM Service Account, Zonal GKE Standard Cluster (`europe-west1-b`), and 4 Node Pools with declarative labels/taints. |
-| **Layer 2: Kubernetes & Batch Orchestration** | [`k8s/`](../k8s/) & [`Makefile`](../Makefile) | **Helm OCI + Kustomize + `kubectl`** | Upstream `jobset` (`0.10.1`), `lws` (`0.11.1`), and `kueue` (`0.16.2`) operators, `kueue.x-k8s.io/v1beta2` scheduling primitives, and Labs 1–6 manifests. |
+| **Layer 2: Kubernetes & Batch Orchestration** | [`k8s/`](../k8s/) & [`Makefile`](../Makefile) | **Helm OCI + Kustomize + `kubectl`** | Upstream `jobset` (`0.10.1`), `lws` (`0.11.1`), and `kueue` (`0.16.2`) operators, `kueue.x-k8s.io/v1beta2` scheduling primitives, CEL `ValidatingAdmissionPolicy`, and Labs 1–9 manifests. |
 
 ---
 
@@ -57,12 +57,12 @@ Both `team-a-cq` and `team-b-cq` belong to `cohortName: "ai-org-cohort"`:
 | **`team-b-cq`** | `spot-flavor` | `0` vCPU / `0` | `0` vCPU / `0` | **`0`** | N/A |
 
 ### Why This Split Preserves 100% Backward Compatibility
-- In **Labs 1–4**, `team-b` has no active workloads, so `team-a-cq` transparently borrows up to `3 vCPUs` from `team-b-cq`, giving `team-a` the exact same **`6 vCPU` effective On-Demand quota** (`3` nominal + `3` borrowed).
+- In **Labs 1–4** and **Labs 6–9**, `team-b` has no active workloads, so `team-a-cq` transparently borrows up to `3 vCPUs` from `team-b-cq`, giving `team-a` the exact same **`6 vCPU` effective On-Demand quota** (`3` nominal + `3` borrowed).
 - In **Lab 5**, when `team-a` runs a `5 vCPU` job (`3` nominal + `2` borrowed) and `team-b` submits a `2.5 vCPU` job into `team-b-queue`, `team-b-cq` reclaims its lent `2 vCPUs` (`reclaimWithinCohort: Any`), preempting `team-a`'s borrowing workload even though `team-b`'s job has a lower `WorkloadPriorityClass` (`100` vs. `1000`).
 
 ---
 
-## 4. End-to-End Capacity Matrix Across Labs 1–6
+## 4. End-to-End Capacity Matrix Across Labs 1–9
 
 | Lab Scenario | Workload Kind | Pods $\times$ CPU Request | Total CPU | Scheduling & Quota Math |
 | :--- | :--- | :--- | :--- | :--- |
@@ -72,3 +72,6 @@ Both `team-a-cq` and `team-b-cq` belong to `cohortName: "ai-org-cohort"`:
 | **Lab 4: Intra-Queue Preemption** | `JobSet` (`team-a`) | $2 \times 2500\text{m}$ | **$5000\text{m}$** | `urgent-prod-training` (`prio=1000`, `5000m`) preempts `research-long-training` (`prio=100`, `5000m`) inside `team-a-cq`. |
 | **Lab 5: Cohort Reclamation** | `JobSet` (`team-a` & `team-b`) | Team A: $2 \times 2500\text{m}$<br>Team B: $1 \times 2500\text{m}$ | **$5000\text{m}$**<br>**$2500\text{m}$** | Team A borrows `2000m` from `team-b-cq`. When Team B submits a `2500m` job (`prio=100`), `team-b-cq` reclaims its nominal quota and preempts Team A (`prio=1000`). |
 | **Lab 6: LWS Cross-PodSet TAS** | `LeaderWorkerSet` (`team-a`) | $1\text{ Leader} \times 1000\text{m}$<br>$+ 1\text{ Worker} \times 1000\text{m}$ | **$2000\text{m}$** | `podset-group-name: "lws-rack-group"` + `podset-required-topology: "workshop.ai/topology-rack"` co-locates both Leader and Worker Pods ($2000\text{m} \le 3292\text{m}$) on the exact same rack node. |
+| **Lab 7: Checkpoint & Resume** | `JobSet` (`team-a`) | Resumable: $2 \times 2500\text{m}$<br>Preemptor: $2 \times 2500\text{m}$ | **$5000\text{m}$**<br>**$5000\text{m}$** | `resumable-research-job` saves checkpoints at Epochs 1–4, gets preempted by `urgent-checkpoint-preemptor` (`5000m`), and resumes from **Epoch 5/8** upon re-admission. |
+| **Lab 8: CEL & Max-Exec-Time** | `JobSet` (`team-a`) | $2 \times 1500\text{m}$ | **$3000\text{m}$** | Unlabeled `JobSet` is rejected at admission by CEL `ValidatingAdmissionPolicy`; labeled `sla-time-bounded-job` (`3000m`) is auto-evicted & deactivated after `20s`. |
+| **Lab 9: Visibility & Metrics** | `JobSet` (`team-a`) | Occupier: $2 \times 2500\text{m}$<br>Queued Low: $2 \times 2000\text{m}$<br>Queued High: $2 \times 2000\text{m}$ | **$5000\text{m}$**<br>**$4000\text{m}$**<br>**$4000\text{m}$** | `obs-occupier-job` reserves `5000m` (`1000m` left); `obs-queued-low` (`4000m`, `prio=100`) and `obs-queued-high` (`4000m`, `prio=1000`) queue behind it, with `obs-queued-high` jumping to Position `0`. |

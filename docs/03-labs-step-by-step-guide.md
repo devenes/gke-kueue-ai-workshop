@@ -1,6 +1,6 @@
-# 03 — Step-by-Step Labs Guide (Labs 1–6)
+# 03 — Step-by-Step Labs Guide (Labs 1–9)
 
-This guide walks through each of the six hands-on labs in [`k8s/labs/`](../k8s/labs/), explaining the manifest design, internal control-plane flow, execution commands, and verified terminal outputs from GKE `v1.36.4-gke.1391002`.
+This guide walks through each of the nine hands-on labs in [`k8s/labs/`](../k8s/labs/), explaining the manifest design, internal control-plane flow, execution commands, and verified terminal outputs from GKE `v1.36.4-gke.1391002`.
 
 ---
 
@@ -244,13 +244,8 @@ sequenceDiagram
 
 ### 3. Execution & Verification Commands
 ```bash
-# Starts team-a-cohort-borrower, prints borrowed quota, then submits team-b-reclaim-owner
 make lab5
-
-# Watch cross-namespace cohort reclamation and automatic re-admission
 kubectl get workloads -A -w
-
-# Clean up both namespaces
 make labs-clean
 ```
 
@@ -269,10 +264,6 @@ type: Preempted, status: True, reason: InCohortReclamation
 message: "Preempted to accommodate a workload (UID: d3a84e9b-3a0c-450a-a339-eda42f5931f0) due to reclamation within the cohort; preemptor path: /ai-org-cohort/team-b-cq; preemptee path: /ai-org-cohort/team-a-cq"
 
 # Once team-b-reclaim-owner finishes its 4 epochs, team-a-cohort-borrower automatically re-borrows and resumes:
-[pod/team-b-reclaim-owner-workers-0-0-k8b4x/pytorch] [Rank 0/1] Initialized on Node: gke-gke-kueue-worksh-on-demand-rack-1-37786744-3n48
-[pod/team-b-reclaim-owner-workers-0-0-k8b4x/pytorch] Epoch [4/4] | World Size: 1 | Loss: 2.3375
-[pod/team-b-reclaim-owner-workers-0-0-k8b4x/pytorch] Distributed Training Completed Successfully!
-
 NAMESPACE   NAME                                  QUEUE          RESERVED IN   ADMITTED   FINISHED   AGE
 team-a      jobset-team-a-cohort-borrower-c7d66   team-a-queue   team-a-cq     True                  41s
 team-b      jobset-team-b-reclaim-owner-524bb     team-b-queue   team-b-cq     True       True       32s
@@ -286,18 +277,7 @@ team-b      jobset-team-b-reclaim-owner-524bb     team-b-queue   team-b-cq     T
 Large Language Models (LLMs) that exceed a single node or socket require multi-pod **Tensor-Parallel (TP)** serving using **LeaderWorkerSet (`leaderworkerset.x-k8s.io/v1`)**, where a Leader Pod (`Rank 0`, serving HTTP `/infer`) and Worker Pod(s) (`Rank 1`, holding model tensor shards) execute synchronous `dist.broadcast` and `dist.all_reduce` operations on every forward pass.
 Because LWS creates **two distinct PodSets** (`leader` and `worker`), we use Kueue's **Cross-PodSet TAS grouping** (`kueue.x-k8s.io/podset-group-name: "lws-rack-group"` + `kueue.x-k8s.io/podset-required-topology: "workshop.ai/topology-rack"`) to guarantee both the Leader Pod and Worker Pod are co-located on the **exact same physical rack node**.
 
-### 2. Manifest Breakdown
-- `kind: LeaderWorkerSet`, `spec.leaderWorkerTemplate.size: 2` (1 Leader + 1 Worker).
-- Both `leaderTemplate` and `workerTemplate` carry:
-  ```yaml
-  annotations:
-    kueue.x-k8s.io/podset-required-topology: "workshop.ai/topology-rack"
-    kueue.x-k8s.io/podset-group-name: "lws-rack-group"
-  ```
-- Each Pod requests `1000m` CPU ($2 \times 1000\text{m} = 2000\text{m}$ total), fitting within a single `e2-standard-4` rack node.
-- Mounts `infer_server.py` from `ConfigMap/pytorch-lws-inference-script`, which runs 3 warmup Tensor-Parallel `AllReduce` steps on startup and exposes `/healthz` and `/infer` on port `8080`.
-
-### 3. Under-the-Hood Sequence Diagram
+### 2. Under-the-Hood Sequence Diagram
 
 ```mermaid
 sequenceDiagram
@@ -318,29 +298,16 @@ sequenceDiagram
     Leader-->>User: JSON {"predicted_class": 7, "all_reduce_latency_ms": 3.757}
 ```
 
-### 4. Execution & Verification Commands
+### 3. Execution & Verification Commands
 ```bash
-# Deploy the LeaderWorkerSet
 make lab6
-
-# Wait for the Leader Pod's HTTP readinessProbe (/healthz) to become Ready
 kubectl wait --for=condition=Ready pod/lws-tas-infer-0 -n team-a --timeout=90s
-
-# Verify both Leader and Worker Pods are co-located on the exact same rack node
 kubectl get pods -n team-a -o wide
-
-# Trigger a live distributed Tensor-Parallel inference step across Leader + Worker
 kubectl exec -n team-a lws-tas-infer-0 -- python3 -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8080/infer').read().decode())"
-
-# Inspect Leader and Worker Tensor-Parallel logs
-kubectl logs -n team-a lws-tas-infer-0
-kubectl logs -n team-a lws-tas-infer-0-1
-
-# Clean up
 make labs-clean
 ```
 
-### 5. Verified Live GKE Output
+### 4. Verified Live GKE Output
 ```text
 NAME                READY   STATUS    RESTARTS   AGE   IP           NODE
 lws-tas-infer-0     1/1     Running   0          9s    10.20.0.25   gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n
@@ -348,19 +315,231 @@ lws-tas-infer-0-1   1/1     Running   0          9s    10.20.0.26   gke-gke-kueu
 
 # Live HTTP /infer response:
 {"model": "pytorch-tp-mlp-2shard", "backend": "gloo", "world_size": 2, "leader_node": "gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n", "predicted_class": 7, "sample_logits": [0.5019, -0.2728, 0.2568, -0.2808], "all_reduce_latency_ms": 3.757}
+```
 
-# Leader Pod (lws-tas-infer-0) Logs:
-[LWS Rank 0/2] Connecting to Leader lws-tas-infer-0.lws-tas-infer.team-a:29500 from Node: gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n
-[LWS Rank 0/2] Initialized Tensor-Parallel Shard on Node: gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n
-[Warmup 1/3] TP World Size: 2 | Node: gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n | AllReduce Latency: 4.20ms | Pred: 0
-[Warmup 2/3] TP World Size: 2 | Node: gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n | AllReduce Latency: 1.48ms | Pred: 0
-[Warmup 3/3] TP World Size: 2 | Node: gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n | AllReduce Latency: 1.24ms | Pred: 4
-[LWS Leader Rank 0] Listening on :8080 (/healthz, /infer) on Node: gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n
-[HTTP /infer] Distributed TP step completed in 3.76ms -> Pred: 7
+---
 
-# Worker Pod (lws-tas-infer-0-1) Logs:
-[LWS Rank 1/2] Connecting to Leader lws-tas-infer-0.lws-tas-infer.team-a:29500 from Node: gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n
-[LWS Rank 1/2] Initialized Tensor-Parallel Shard on Node: gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n
-[LWS Worker Rank 1] Entering Tensor-Parallel worker loop on Node: gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n
-[LWS Worker Rank 1] Participated in TP AllReduce (3.49ms) on Node: gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n
+## Lab 7: Stateful DDP Checkpointing & Graceful Preemption Resume ([`k8s/labs/lab7-checkpoint-resume.yaml`](../k8s/labs/lab7-checkpoint-resume.yaml))
+
+### 1. Scenario & Objective
+In **Lab 4** and **Lab 5**, preempted workloads restarted from Epoch 1 upon re-admission, losing their prior training compute ("badput"). **Lab 7** demonstrates **zero-goodput-loss stateful checkpointing**:
+1. `resumable-research-job` (`priority=100`, `5 vCPUs`, `8` epochs) runs `exec torchrun ... /workspace/train_checkpoint.py` (`ConfigMap/pytorch-checkpoint-script`) and atomically saves `model_state_dict`, `optimizer_state_dict`, and `epoch` to `/var/tmp/kueue-checkpoints/lab7_ckpt.pt` after every epoch.
+2. After completing **Epoch 4/8**, `urgent-checkpoint-preemptor` (`priority=1000`, `5 vCPUs`, `3` epochs) arrives and preempts `resumable-research-job`.
+3. Once `urgent-checkpoint-preemptor` finishes its 3 epochs, Kueue automatically re-admits `resumable-research-job`. On startup, both ranks load the checkpoint, synchronize `synced_epoch = 4` via `dist.all_reduce(..., ReduceOp.MAX)`, and **resume directly at Epoch 5/8** (`Zero Goodput Lost!`).
+
+### 2. Under-the-Hood Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant ResJob as resumable-research-job (prio=100)
+    participant Ckpt as Node Checkpoint (/var/tmp/kueue-checkpoints)
+    participant Kueue as Kueue Controller (team-a-cq)
+    participant Urgent as urgent-checkpoint-preemptor (prio=1000)
+
+    Kueue->>ResJob: Initial Admission (5 vCPU) -> Fresh Start (Epoch 1/8)
+    ResJob->>Ckpt: Save atomic checkpoint after Epochs 1, 2, 3, 4
+    Urgent->>Kueue: Submit urgent-checkpoint-preemptor (5 vCPU, prio=1000)
+    Kueue->>ResJob: Preempt! Send SIGTERM (exec torchrun PID 1)
+    ResJob->>Ckpt: Persist Epoch 4 state & exit cleanly
+    Kueue->>Urgent: Admit urgent-checkpoint-preemptor -> Complete 3 Epochs
+    Kueue->>ResJob: Automatically Re-Admit resumable-research-job!
+    ResJob->>Ckpt: Load Epoch 4 state + dist.all_reduce(MAX) across ranks
+    ResJob-->>Kueue: Resume from Epoch 5/8 -> Complete Epochs 5..8!
+```
+
+### 3. Execution & Verification Commands
+```bash
+# Starts resumable-research-job, waits for ~4 epochs, prints pre-preemption logs, and submits urgent-checkpoint-preemptor
+make lab7
+
+# Wait for urgent-checkpoint-preemptor to finish and resumable-research-job to be re-admitted
+kubectl wait --for=condition=Completed jobset/urgent-checkpoint-preemptor -n team-a --timeout=120s
+kubectl wait --for=condition=Ready pod -l jobset.sigs.k8s.io/jobset-name=resumable-research-job -n team-a --timeout=90s
+
+# Inspect resumed logs proving training continued from Epoch 5/8!
+kubectl logs -l jobset.sigs.k8s.io/jobset-name=resumable-research-job,batch.kubernetes.io/job-completion-index=0 -n team-a -f
+
+# Clean up
+make labs-clean
+```
+
+### 4. Verified Live GKE Output
+```text
+=== Pre-Preemption Logs (resumable-research-job Rank 0) ===
+[Rank 0/2] Initialized on Node: gke-gke-kueue-worksh-on-demand-rack-1-37786744-3n48 | Checkpoint Path: /var/tmp/kueue-checkpoints/lab7_ckpt.pt
+🆕 [FRESH START] No checkpoint found. Starting from Epoch 1/8
+Epoch [1/8] | World Size: 2 | Loss: 2.3228 | 💾 Checkpoint saved (/var/tmp/kueue-checkpoints/lab7_ckpt.pt)
+Epoch [2/8] | World Size: 2 | Loss: 2.3187 | 💾 Checkpoint saved (/var/tmp/kueue-checkpoints/lab7_ckpt.pt)
+Epoch [3/8] | World Size: 2 | Loss: 2.3130 | 💾 Checkpoint saved (/var/tmp/kueue-checkpoints/lab7_ckpt.pt)
+Epoch [4/8] | World Size: 2 | Loss: 2.3255 | 💾 Checkpoint saved (/var/tmp/kueue-checkpoints/lab7_ckpt.pt)
+
+Submitting urgent-checkpoint-preemptor (priority=1000) to preempt resumable-research-job...
+jobset.jobset.x-k8s.io/urgent-checkpoint-preemptor created
+
+=== Final Completed Logs After Automatic Re-Admission (resumable-research-job Rank 0) ===
+[Rank 0/2] Initialized on Node: gke-gke-kueue-worksh-on-demand-rack-1-37786744-3n48 | Checkpoint Path: /var/tmp/kueue-checkpoints/lab7_ckpt.pt
+🔄 [RESUMED FROM CHECKPOINT] Found saved state at Epoch 4! Resuming training from Epoch 5/8 (Zero Goodput Lost!)
+Epoch [5/8] | World Size: 2 | Loss: 2.3044 | 💾 Checkpoint saved (/var/tmp/kueue-checkpoints/lab7_ckpt.pt)
+Epoch [6/8] | World Size: 2 | Loss: 2.3017 | 💾 Checkpoint saved (/var/tmp/kueue-checkpoints/lab7_ckpt.pt)
+Epoch [7/8] | World Size: 2 | Loss: 2.2941 | 💾 Checkpoint saved (/var/tmp/kueue-checkpoints/lab7_ckpt.pt)
+Epoch [8/8] | World Size: 2 | Loss: 2.3062 | 💾 Checkpoint saved (/var/tmp/kueue-checkpoints/lab7_ckpt.pt)
+🎉 Distributed Training Completed All 8 Epochs Successfully! (Cleaned up /var/tmp/kueue-checkpoints/lab7_ckpt.pt)
+```
+
+---
+
+## Lab 8: CEL `ValidatingAdmissionPolicy` Governance & `max-exec-time-seconds` SLA ([`k8s/labs/lab8-governance-and-max-exec.yaml`](../k8s/labs/lab8-governance-and-max-exec.yaml))
+
+### 1. Scenario & Objective
+Production multi-tenant AI platforms require two hard guardrails:
+1. **Zero-Bypass Queue Governance (Step 8A):** Using a native Kubernetes `ValidatingAdmissionPolicy` (`require-kueue-queue-name` bound to namespaces with `kueue-governance: "enforced"`), any `JobSet` or `LeaderWorkerSet` that omits `kueue.x-k8s.io/queue-name` (`unlabeled-rogue-jobset`) is **synchronously rejected** by the Kubernetes API Server before a single Pod can be created.
+2. **Maximum Execution Time SLA Enforcement (Step 8B):** By labeling `sla-time-bounded-job` with `kueue.x-k8s.io/max-exec-time-seconds: "20"`, Kueue sets `spec.maximumExecutionTimeSeconds: 20` on the `Workload`. When the job's runtime exceeds 20 seconds, Kueue automatically **evicts and deactivates** (`spec.active: false`) the runaway job with `reason: DeactivatedDueToMaximumExecutionTimeExceeded`.
+
+### 2. Under-the-Hood Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant User as AI/ML Engineer
+    participant APIServer as K8s API Server (CEL Policy)
+    participant Kueue as Kueue Controller (SLA Timer)
+    participant Job as JobSet: sla-time-bounded-job
+
+    User->>APIServer: 8A: Submit unlabeled-rogue-jobset (no queue-name label)
+    APIServer-->>User: DENIED! ValidatingAdmissionPolicy 'require-kueue-queue-name'
+    User->>APIServer: 8B: Submit sla-time-bounded-job (queue-name + max-exec-time-seconds="20")
+    APIServer->>Kueue: Allowed -> Create Workload (maximumExecutionTimeSeconds: 20)
+    Kueue->>Job: Admit Workload -> Pods Running (t = 0s..20s)
+    Note over Kueue,Job: t = 20s: Execution Lease Expired!
+    Kueue->>Job: Evict & Deactivate Workload (spec.active = false, reason: DeactivatedDueToMaximumExecutionTimeExceeded)
+```
+
+### 3. Execution & Verification Commands
+```bash
+make lab8
+kubectl get workloads,jobsets,pods -n team-a
+make labs-clean
+```
+
+### 4. Verified Live GKE Output
+```text
+=== Step 8A: Attempting to submit unlabeled-rogue-jobset (omits kueue.x-k8s.io/queue-name) ===
+The jobsets "unlabeled-rogue-jobset" is invalid: : ValidatingAdmissionPolicy 'require-kueue-queue-name' with binding 'require-kueue-queue-name-binding' denied request: Platform Governance Policy Violation: All JobSet and LeaderWorkerSet workloads in Kueue-managed namespaces MUST specify a non-empty 'kueue.x-k8s.io/queue-name' label.
+✅ CEL ValidatingAdmissionPolicy successfully blocked the unlabeled rogue workload!
+
+=== Step 8B: Submitting sla-time-bounded-job (kueue.x-k8s.io/max-exec-time-seconds: 20) ===
+jobset.jobset.x-k8s.io/sla-time-bounded-job created
+
+=== Workload Admitted with spec.maximumExecutionTimeSeconds=20 ===
+NAME                                QUEUE          MAX_EXEC_SEC   ACTIVE   ADMITTED
+jobset-sla-time-bounded-job-c73ae   team-a-queue   20             true     True
+
+Waiting ~25s for 20-second SLA lease to expire and Kueue to auto-evict the runaway job...
+
+=== Workload Status After 20s SLA Expiration (MaximumExecutionTimeExceeded -> Active=false) ===
+NAME                                ACTIVE   EVICTED_REASON                                 MESSAGE
+jobset-sla-time-bounded-job-c73ae   false    DeactivatedDueToMaximumExecutionTimeExceeded   The workload is deactivated due to exceeding the maximum execution time
+```
+
+---
+
+## Lab 9: Kueue Visibility API & Prometheus Metrics Observability ([`k8s/labs/lab9-visibility-and-metrics.yaml`](../k8s/labs/lab9-visibility-and-metrics.yaml))
+
+### 1. Scenario & Objective
+When multiple workloads are queued waiting for capacity, AI engineers ask *"Where is my job in the queue?"* and platform SREs ask *"What is our queue depth, admission rate, and quota utilization?"*
+1. `obs-occupier-job` (`5 vCPU`, `priority=1000`) is admitted first, leaving only `1 vCPU` free in `team-a-cq`'s On-Demand quota.
+2. `obs-queued-low` (`4 vCPU`, `priority=100`) is submitted at `t = 22:32:13Z` and enters the pending queue.
+3. `obs-queued-high` (`4 vCPU`, `priority=1000`) is submitted 3 seconds later at `t = 22:32:16Z`.
+4. Querying Kueue's **On-Demand Visibility API** (`/apis/visibility.kueue.x-k8s.io/v1beta2/namespaces/team-a/localqueues/team-a-queue/pendingworkloads`) proves that `obs-queued-high` jumped ahead of `obs-queued-low` to **`positionInClusterQueue: 0`** (`positionInLocalQueue: 0`).
+5. Scraping Kueue's **Prometheus `/metrics` endpoint** (`:8443/metrics`) exports live `kueue_pending_workloads`, `kueue_admitted_workloads_total`, `kueue_cluster_queue_nominal_quota`, and `kueue_cluster_queue_resource_usage` metrics.
+
+### 2. Under-the-Hood Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant User as AI Engineer / SRE
+    participant Kueue as Kueue Queue Manager
+    participant VisAPI as Visibility Server (visibility.kueue.x-k8s.io/v1beta2)
+    participant Prom as Prometheus Metrics (:8443/metrics)
+
+    User->>Kueue: 1. Submit obs-occupier-job (5 vCPU, prio=1000) -> Admitted!
+    User->>Kueue: 2. Submit obs-queued-low (4 vCPU, prio=100, t=13s) -> Pending
+    User->>Kueue: 3. Submit obs-queued-high (4 vCPU, prio=1000, t=16s) -> Pending
+    Note over Kueue: Kueue reorders pending heap:<br/>obs-queued-high (pos=0) > obs-queued-low (pos=1)
+    User->>VisAPI: GET /apis/visibility.kueue.x-k8s.io/v1beta2/.../pendingworkloads
+    VisAPI-->>User: PendingWorkloadsSummary (obs-queued-high=0, obs-queued-low=1)
+    User->>Prom: GET https://kueue-controller-manager-metrics-service:8443/metrics
+    Prom-->>User: kueue_cluster_queue_resource_usage=5, kueue_pending_workloads=2
+```
+
+### 3. Execution & Verification Commands
+```bash
+# Submits the 3 workloads, queries the Visibility API, and scrapes Prometheus metrics
+make lab9
+
+# Clean up
+make labs-clean
+```
+
+### 4. Verified Live GKE Output
+```text
+=== Step 9C: Kueue Visibility API (v1beta2 PendingWorkloadsSummary on team-a-queue) ===
+{
+    "kind": "PendingWorkloadsSummary",
+    "apiVersion": "visibility.kueue.x-k8s.io/v1beta2",
+    "metadata": {},
+    "items": [
+        {
+            "metadata": {
+                "name": "jobset-obs-queued-high-9171b",
+                "namespace": "team-a",
+                "creationTimestamp": "2026-10-13T22:32:16Z",
+                "ownerReferences": [
+                    {
+                        "apiVersion": "jobset.x-k8s.io/v1alpha2",
+                        "kind": "JobSet",
+                        "name": "obs-queued-high",
+                        "uid": "d3698628-5a81-41de-99b6-875f17a532ed"
+                    }
+                ]
+            },
+            "priority": 1000,
+            "localQueueName": "team-a-queue",
+            "positionInClusterQueue": 0,
+            "positionInLocalQueue": 0
+        },
+        {
+            "metadata": {
+                "name": "jobset-obs-queued-low-8378d",
+                "namespace": "team-a",
+                "creationTimestamp": "2026-10-13T22:32:13Z",
+                "ownerReferences": [
+                    {
+                        "apiVersion": "jobset.x-k8s.io/v1alpha2",
+                        "kind": "JobSet",
+                        "name": "obs-queued-low",
+                        "uid": "91fb9c6e-2786-437d-b1bd-4155d57712f3"
+                    }
+                ]
+            },
+            "priority": 100,
+            "localQueueName": "team-a-queue",
+            "positionInClusterQueue": 1,
+            "positionInLocalQueue": 1
+        }
+    ]
+}
+
+=== Step 9D: Scraping Kueue Prometheus Metrics (/metrics on :8443) ===
+kueue_admitted_workloads_total{cluster_queue="team-a-cq",priority_class="high-prod-priority",replica_role="leader"} 1
+kueue_admitted_workloads_total{cluster_queue="team-a-cq",priority_class="low-research-priority",replica_role="leader"} 1
+kueue_cluster_queue_nominal_quota{cluster_queue="team-a-cq",cohort="ai-org-cohort",flavor="on-demand-flavor",replica_role="leader",resource="cpu"} 3
+kueue_cluster_queue_nominal_quota{cluster_queue="team-a-cq",cohort="ai-org-cohort",flavor="on-demand-flavor",replica_role="leader",resource="memory"} 8.589934592e+09
+kueue_cluster_queue_nominal_quota{cluster_queue="team-a-cq",cohort="ai-org-cohort",flavor="spot-flavor",replica_role="leader",resource="cpu"} 9
+kueue_cluster_queue_nominal_quota{cluster_queue="team-a-cq",cohort="ai-org-cohort",flavor="spot-flavor",replica_role="leader",resource="memory"} 2.5769803776e+10
+kueue_cluster_queue_resource_usage{cluster_queue="team-a-cq",cohort="ai-org-cohort",flavor="on-demand-flavor",replica_role="leader",resource="cpu"} 5
+kueue_cluster_queue_resource_usage{cluster_queue="team-a-cq",cohort="ai-org-cohort",flavor="on-demand-flavor",replica_role="leader",resource="memory"} 4.294967296e+09
+kueue_cluster_queue_resource_usage{cluster_queue="team-a-cq",cohort="ai-org-cohort",flavor="spot-flavor",replica_role="leader",resource="cpu"} 0
+kueue_cluster_queue_resource_usage{cluster_queue="team-a-cq",cohort="ai-org-cohort",flavor="spot-flavor",replica_role="leader",resource="memory"} 0
+kueue_pending_workloads{cluster_queue="team-a-cq",replica_role="leader",status="active"} 0
+kueue_pending_workloads{cluster_queue="team-a-cq",replica_role="leader",status="inadmissible"} 2
 ```

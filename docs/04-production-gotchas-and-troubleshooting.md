@@ -1,6 +1,6 @@
 # 04 — Production Gotchas & Troubleshooting (Live GKE `v1.36` Field Notes)
 
-During live testing of Labs 1–6 on GKE Standard `v1.36.4-gke.1391002`, we encountered and resolved seven subtle, real-world production issues across Kubernetes Cluster Autoscaler, Kueue `v1beta2`, `JobSet`, `LeaderWorkerSet`, and Helm 4.
+During live testing of Labs 1–9 on GKE Standard `v1.36.4-gke.1391002`, we encountered and resolved ten subtle, real-world production issues across Kubernetes Cluster Autoscaler, Kueue `v1beta2`, `JobSet`, `LeaderWorkerSet`, PyTorch DDP Checkpointing, CEL Admission Policies, and Prometheus Observability.
 
 ---
 
@@ -44,7 +44,7 @@ Install Kueue `v0.16.2+` and use `cohortName: "ai-org-cohort"` in `v1beta2` `Clu
 
 ## Gotcha 4: `JobSet` Immutability Webhook & Helm 4 Server-Side Apply Conflicts
 
-- **JobSet Webhook Immutability:** When Kueue admits a `JobSet`, it mutates the Pod template inside `spec.replicatedJobs`. Re-running `kubectl apply` on an already-admitted multi-document YAML triggers `spec.replicatedJobs: Invalid value: ... field is immutable`. In [`Makefile`](../Makefile), `make lab4` and `make lab5` apply Document 1 first, wait for `Ready` Pods, and then pipe only Document 2 (`awk 'f{print} /^---$$/{f=1}'`) to `kubectl apply -f -`.
+- **JobSet Webhook Immutability:** When Kueue admits a `JobSet`, it mutates the Pod template inside `spec.replicatedJobs`. Re-running `kubectl apply` on an already-admitted multi-document YAML triggers `spec.replicatedJobs: Invalid value: ... field is immutable`. In [`Makefile`](../Makefile), `make lab4`, `make lab5`, and `make lab7` apply Document 1 first, wait for `Ready` Pods, and then pipe only Document 2 (`awk 'f{print} /^---$$/{f=1}'`) to `kubectl apply -f -`.
 - **Helm 4 Server-Side Apply Conflict:** Helm 4 defaults to Server-Side Apply, conflicting with controller-populated webhook TLS Secrets on repeated upgrades. Guarding `operators-install` with `helm status <release> -n <ns> >/dev/null 2>&1 || helm upgrade --install ...` ensures idempotency.
 
 ---
@@ -73,3 +73,27 @@ Because `LeaderWorkerSet` defines a `leaderTemplate` and a `workerTemplate`, Kue
 In **Lab 5**, `team-a-cohort-borrower` runs with `high-prod-priority` (`1000`), while `team-b-reclaim-owner` is submitted with `low-research-priority` (`100`). Why does the priority `100` job preempt the priority `1000` job?
 - Because `team-a-cq` is **borrowing** `2 vCPUs` of `team-b-cq`'s nominal quota, and `reclaimWithinCohort: Any` is configured on the `ClusterQueue`s.
 - In Kueue, nominal quota ownership within a cohort takes precedence over cross-queue priority when `reclaimWithinCohort: Any` is set, guaranteeing that lending idle capacity never prevents the lending team from running its own workloads (`reason: InCohortReclamation`).
+
+---
+
+## Gotcha 8: Stateful DDP Checkpointing (`exec torchrun` PID 1, `hostPath` UID Permissions & Multi-Node Sync)
+
+In **Lab 7**, three subtle interactions occur when implementing stateful checkpointing across distributed `JobSet` Pods:
+1. **`bash -c` Swallowing `SIGTERM` Without `exec`:** When Kubernetes evicts a Pod, `kubelet` sends `SIGTERM` only to **PID 1**. If `torchrun` is invoked inside `bash -c "torchrun ..."` without `exec`, `bash` is PID 1 and does not forward `SIGTERM` to `torchrun`. Using `exec torchrun ...` promotes `torchrun` to PID 1 so `SIGTERM` reaches `train_checkpoint.py` immediately.
+2. **`hostPath` (`DirectoryOrCreate`) Root Ownership vs. Non-Root Container User:** The `pytorch/torchserve:0.12.0-cpu` image defaults to user `model-server` (UID `1000`), whereas `kubelet` creates `hostPath` `DirectoryOrCreate` directories (`/var/tmp/kueue-checkpoints`) owned by `root:root` (`0755`). Setting `securityContext.runAsUser: 0` on the Pod spec prevents `PermissionError` when writing atomic checkpoint files (`tmp` + `os.replace`).
+3. **Avoid `ReadWriteOnce` (`RWO`) PVCs for Multi-Node DDP Jobs:** Standard GKE `pd-balanced` PVCs only support `ReadWriteOnce` (single-node attachment) and fail with `Multi-Attach error` when Ranks 0 and 1 run on `on-demand-rack-1` and `on-demand-rack-2`. Persisting checkpoints on all ranks + synchronizing `synced_epoch` via `dist.all_reduce(local_epoch, op=dist.ReduceOp.MAX)` on startup eliminates `RWO` volume contention.
+
+---
+
+## Gotcha 9: Native Kubernetes CEL `ValidatingAdmissionPolicy` Expression Syntax
+
+In **Lab 8** ([`k8s/base/governance-policy.yaml`](../k8s/base/governance-policy.yaml)), inspecting `object.metadata.labels['kueue.x-k8s.io/queue-name']` directly in CEL throws a runtime evaluation error when `metadata.labels` is omitted on the submitted resource (`no such key: labels`).
+- **Fix:** Always guard map lookups in CEL with `has(object.metadata.labels) && 'kueue.x-k8s.io/queue-name' in object.metadata.labels && object.metadata.labels['kueue.x-k8s.io/queue-name'].size() > 0`.
+
+---
+
+## Gotcha 10: Enabling Kueue `ClusterQueue` Resource Metrics (`enableClusterQueueResources: true`) & RBAC Scraping
+
+In **Lab 9**:
+1. **Opt-In `ClusterQueue` Resource Metrics:** By default, the Kueue Helm chart (`0.16.2`) leaves `# enableClusterQueueResources: true` commented out in `kueue-manager-config`, which omits `kueue_cluster_queue_nominal_quota` and `kueue_cluster_queue_resource_usage` from `/metrics`. Enabling `enableClusterQueueResources: true` under `metrics:` in `kueue-manager-config` activates per-flavor CPU and memory gauges.
+2. **HTTPS RBAC Auth on `:8443/metrics`:** Kueue's metrics service (`kueue-controller-manager-metrics-service:8443`) enforces Kubernetes SubjectAccessReview authorization (`nonResourceURLs: ["/metrics"]`). Binding the pre-installed `kueue-metrics-reader` `ClusterRole` via `ClusterRoleBinding/kueue-metrics-reader-binding` ([`k8s/base/governance-policy.yaml`](../k8s/base/governance-policy.yaml)) allows authenticated scraping via `kubectl create token kueue-controller-manager -n kueue-system`.
