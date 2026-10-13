@@ -1,0 +1,109 @@
+name: CI — Static Analysis & Manifest Validation
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: Terraform Format & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.x"
+          terraform_wrapper: false
+
+      - name: Terraform Format Check
+        run: terraform -chdir=terraform fmt -check -diff
+
+      - name: Terraform Init (Backend Disabled)
+        run: terraform -chdir=terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform -chdir=terraform validate
+
+  k8s-and-python:
+    name: K8s Manifests, Kustomize, YAML Lint & Embedded Python AST
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install yamllint & PyYAML
+        run: pip install --quiet yamllint pyyaml
+
+      - name: Run yamllint on K8s manifests and CI workflow
+        run: yamllint -c .yamllint.yaml k8s/ .github/workflows/ci.yml .yamllint.yaml
+
+      - name: Build Kustomize base manifests
+        run: |
+          kubectl kustomize k8s/base > /tmp/base-rendered.yaml
+          test -s /tmp/base-rendered.yaml
+
+      - name: Install kubeconform (v0.6.7)
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+
+      - name: Validate K8s manifests with kubeconform
+        run: kubeconform -ignore-missing-schemas -strict -summary /tmp/base-rendered.yaml k8s/labs/*.yaml
+
+      - name: Validate embedded Python scripts in ConfigMaps (AST Syntax Check)
+        run: |
+          python3 - <<'PY'
+          import ast
+          import sys
+          import yaml
+
+          cm_path = "k8s/base/pytorch-ddp-configmap.yaml"
+          checked = 0
+          with open(cm_path, "r", encoding="utf-8") as fh:
+              for doc in yaml.safe_load_all(fh):
+                  if not doc or doc.get("kind") != "ConfigMap":
+                      continue
+                  cm_name = doc["metadata"]["name"]
+                  cm_ns = doc["metadata"].get("namespace", "default")
+                  for key, script in doc.get("data", {}).items():
+                      if key.endswith(".py"):
+                          ast.parse(script, filename=f"{cm_ns}/{cm_name}:{key}")
+                          print(f"[PASS] Valid Python 3 AST: {cm_ns}/{cm_name} -> {key} ({len(script.splitlines())} lines)")
+                          checked += 1
+
+          if checked == 0:
+              print("ERROR: No embedded Python scripts found!", file=sys.stderr)
+              sys.exit(1)
+          print(f"Successfully validated {checked} embedded Python scripts.")
+          PY
+
+  shell-and-makefile:
+    name: ShellCheck & Makefile Dry-Run
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Bash syntax check (bash -n)
+        run: bash -n scripts/preflight-check.sh scripts/smoke-test-all.sh
+
+      - name: Run ShellCheck on automation scripts
+        run: shellcheck --severity=warning scripts/preflight-check.sh scripts/smoke-test-all.sh
+
+      - name: Verify Makefile help and dry-run targets
+        run: |
+          make help
+          make -n lint preflight test-all lab1 lab2 lab3 lab4 lab5 lab6 lab7 lab8 lab9 labs-clean > /dev/null
+          echo "[PASS] All Makefile targets resolved cleanly."

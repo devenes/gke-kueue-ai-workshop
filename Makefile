@@ -9,13 +9,36 @@ KUEUE_VERSION  ?= 0.16.2
 
 .DEFAULT_GOAL := help
 
-.PHONY: help infra-init infra-plan infra-up infra-down kubeconfig operators-install base-apply status preflight test-all lab1 lab2 lab3 lab4 lab5 lab6 lab7 lab8 lab9 labs-clean
+.PHONY: help lint infra-init infra-plan infra-up infra-down kubeconfig operators-install base-apply status preflight test-all lab1 lab2 lab3 lab4 lab5 lab6 lab7 lab8 lab9 labs-clean
 
 help: ## Show available workshop Make targets
 	@echo "================================================================================"
 	@echo " GKE Kueue AI/ML Batch Scheduling Workshop (CPU PyTorch DDP + TAS + Spot + LWS)"
 	@echo "================================================================================"
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+
+lint: ## Run all static analysis checks (Terraform fmt/validate, Kustomize, Python AST, ShellCheck)
+	@echo "=== 1. Terraform Format & Validate ==="
+	terraform -chdir=terraform fmt -check -diff
+	@test -d terraform/.terraform || terraform -chdir=terraform init -backend=false >/dev/null
+	terraform -chdir=terraform validate
+	@echo "=== 2. Kustomize Base Build Verification ==="
+	kubectl kustomize k8s/base > /dev/null
+	@echo "=== 3. Embedded Python ConfigMap AST Syntax Check ==="
+	@python3 -c 'import ast, sys, yaml; \
+docs = list(yaml.safe_load_all(open("k8s/base/pytorch-ddp-configmap.yaml"))); \
+scripts = [(d["metadata"]["namespace"], d["metadata"]["name"], k, v) for d in docs if d and d.get("kind")=="ConfigMap" for k, v in d.get("data", {}).items() if k.endswith(".py")]; \
+[ast.parse(v, filename=f"{ns}/{nm}:{k}") for ns, nm, k, v in scripts]; \
+print(f"Verified valid Python 3 AST across {len(scripts)} embedded ConfigMap scripts.")'
+	@echo "=== 4. Shell Script Syntax & ShellCheck ==="
+	bash -n scripts/preflight-check.sh scripts/smoke-test-all.sh
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck --severity=warning scripts/preflight-check.sh scripts/smoke-test-all.sh && echo "ShellCheck passed with 0 warnings."; \
+	fi
+	@if command -v yamllint >/dev/null 2>&1; then \
+		yamllint -c .yamllint.yaml k8s/ .github/workflows/ci.yml .yamllint.yaml && echo "yamllint passed."; \
+	fi
+	@echo "✅ All static analysis & lint checks passed!"
 
 infra-init: ## Initialize Terraform providers in terraform/
 	terraform -chdir=terraform init

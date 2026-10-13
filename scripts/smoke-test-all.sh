@@ -21,7 +21,6 @@ declare -a LAB_NAMES=(
 )
 declare -a LAB_STATUS=()
 declare -a LAB_DURATION=()
-declare -a LAB_DETAIL=()
 
 banner() {
   printf "\n\033[1;36m================================================================================\033[0m\n"
@@ -34,9 +33,8 @@ record_result() {
   local status="$2"
   local dur="$3"
   local detail="$4"
-  LAB_STATUS[$idx]="$status"
-  LAB_DURATION[$idx]="${dur}s"
-  LAB_DETAIL[$idx]="$detail"
+  LAB_STATUS[idx]="$status"
+  LAB_DURATION[idx]="${dur}s"
   if [[ "$status" == "PASS" ]]; then
     printf "\033[32m[PASS]\033[0m %s (%ss) — %s\n" "${LAB_NAMES[$idx]}" "$dur" "$detail"
   else
