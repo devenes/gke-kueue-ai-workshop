@@ -97,3 +97,11 @@ In **Lab 8** ([`k8s/base/governance-policy.yaml`](../k8s/base/governance-policy.
 In **Lab 9**:
 1. **Opt-In `ClusterQueue` Resource Metrics:** By default, the Kueue Helm chart (`0.16.2`) leaves `# enableClusterQueueResources: true` commented out in `kueue-manager-config`, which omits `kueue_cluster_queue_nominal_quota` and `kueue_cluster_queue_resource_usage` from `/metrics`. Enabling `enableClusterQueueResources: true` under `metrics:` in `kueue-manager-config` activates per-flavor CPU and memory gauges.
 2. **HTTPS RBAC Auth on `:8443/metrics`:** Kueue's metrics service (`kueue-controller-manager-metrics-service:8443`) enforces Kubernetes SubjectAccessReview authorization (`nonResourceURLs: ["/metrics"]`). Binding the pre-installed `kueue-metrics-reader` `ClusterRole` via `ClusterRoleBinding/kueue-metrics-reader-binding` ([`k8s/base/governance-policy.yaml`](../k8s/base/governance-policy.yaml)) allows authenticated scraping via `kubectl create token kueue-controller-manager -n kueue-system`.
+
+---
+
+## Automated Diagnostics & Regression Verification (`make preflight` & `make test-all`)
+
+To eliminate manual troubleshooting before live workshops or after GKE upgrades, the [`scripts/`](../scripts/) directory provides two automated verification tools:
+- **`make preflight` ([`scripts/preflight-check.sh`](../scripts/preflight-check.sh)):** Runs 14 health checks in ~15 seconds, auditing node readiness, topology labels (`block-1/rack-1|2`), free allocatable CPU ($\ge 3000\text{m}$ per on-demand rack), operator deployments (`jobset-controller`, `lws-controller-manager`, `kueue-controller-manager`), webhook endpoints, `v1beta2` `ClusterQueue`/`LocalQueue` `Active=True` status, CEL `ValidatingAdmissionPolicy`, Visibility API `PendingWorkloadsSummary`, and Prometheus `:8443/metrics`.
+- **`make test-all` ([`scripts/smoke-test-all.sh`](../scripts/smoke-test-all.sh)):** Runs `make preflight` followed by an end-to-end automated execution and assertion suite across all 9 labs, cleaning up between each lab and printing a final 9/9 pass/fail summary table.

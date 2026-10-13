@@ -6,7 +6,7 @@ Use this **Two-Terminal Split-Screen Runbook** when delivering a live conference
 
 ## Pre-Talk Checklist (15 Minutes Before Going Live)
 
-Run these commands once before your session so the GKE cluster is up, all three operators (`jobset`, `lws`, `kueue`) are running on `system-pool`, and the `548 MB` `pytorch/torchserve:0.12.0-cpu` image is cached on the on-demand nodes:
+Run these commands once before your session to verify the GKE cluster, operators, queues, CEL policies, observability endpoints, and image caches:
 
 ```bash
 # 1. Verify cluster credentials, operators, and Kueue base setup
@@ -15,9 +15,69 @@ make operators-install
 make base-apply
 make labs-clean
 
-# 2. Pre-warm the container image on on-demand nodes (takes ~20s once)
-make lab2 && kubectl wait --for=condition=Completed jobset/pytorch-tas-same-rack -n team-a --timeout=90s
-make labs-clean
+# 2. Run the 15-second 14-point Pre-Flight Check (must show 14 PASSED, 0 FAILED)
+make preflight
+
+# 3. (Optional Rehearsal) Run the full 9-lab automated E2E smoke test (~3.5 mins)
+make test-all
+```
+
+### Expected `make preflight` Output
+```text
+================================================================================
+ GKE Kueue AI Workshop — Pre-Flight Environment Check
+================================================================================
+
+1. Cluster & Node Topology Check
+  [PASS] system-pool node Ready (gke-gke-kueue-workshop-system-pool-be3c118f-6cgc, workload=system)
+  [PASS] on-demand-rack-1 node Ready (gke-gke-kueue-worksh-on-demand-rack-1-37786744-3n48, block-1/rack-1)
+  [PASS] on-demand-rack-2 node Ready (gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n, block-1/rack-2)
+  [PASS] Free allocatable CPU >= 3000m per on-demand rack (rack-1=3450m/3920m, rack-2=3335m/3920m)
+
+2. Operators & Webhooks Check
+  [PASS] jobset-system/jobset-controller Available=True (nodeSelector.workload=system, webhook=10.20.1.4)
+  [PASS] lws-system/lws-controller-manager Available=True (nodeSelector.workload=system, webhook=10.20.1.8)
+  [PASS] kueue-system/kueue-controller-manager Available=True (nodeSelector.workload=system, webhook=10.20.1.10)
+
+3. Kueue v1beta2 Control Plane Check
+  [PASS] Topology (gke-dc-topology), ResourceFlavors (on-demand/spot), & ProvisioningRequestConfig verified
+  [PASS] AdmissionCheck, ClusterQueues (team-a-cq & team-b-cq in ai-org-cohort), & LocalQueues Active=True
+
+4. Governance & ConfigMaps Check
+  [PASS] CEL ValidatingAdmissionPolicy (require-kueue-queue-name) & namespace labels (kueue-governance=enforced) active
+  [PASS] PyTorch ConfigMaps (pytorch-ddp-script, pytorch-lws-inference-script, pytorch-checkpoint-script) present
+
+5. Observability Endpoints Check
+  [PASS] Kueue Visibility API v1beta2 (/pendingworkloads -> PendingWorkloadsSummary) reachable
+  [PASS] Kueue Prometheus metrics (:8443/metrics) reachable & exporting kueue_cluster_queue_nominal_quota
+
+6. Clean State Check
+  [PASS] Zero stale JobSets, LeaderWorkerSets, or Workloads in team-a & team-b
+
+================================================================================
+ Summary: 14 PASSED, 0 FAILED
+================================================================================
+```
+
+### Expected `make test-all` Summary Table
+```text
+================================================================================
+ GKE KUEUE AI WORKSHOP — 9-LAB SMOKE TEST SUMMARY (Total: 286s)
+================================================================================
+Lab Scenario                                         | Status | Duration
+--------------------------------------------------------------------------------
+Lab 1: All-or-Nothing Gang Scheduling                | PASS   | 9s      
+Lab 2: Topology Aware Scheduling (Same-Rack)         | PASS   | 9s      
+Lab 3: Spot Spillover & Atomic ProvisioningRequest   | PASS   | 95s     
+Lab 4: Intra-Queue Priority Preemption               | PASS   | 15s     
+Lab 5: Multi-Team Cohort Borrowing & Reclamation     | PASS   | 15s     
+Lab 6: LeaderWorkerSet Inference & Cross-PodSet TAS  | PASS   | 14s     
+Lab 7: Stateful DDP Checkpointing & Resume           | PASS   | 79s     
+Lab 8: CEL Admission Governance & Max-Exec-Time SLA  | PASS   | 32s     
+Lab 9: Visibility API & Prometheus Metrics           | PASS   | 17s     
+================================================================================
+ RESULT: 9/9 LABS PASSED (100%)
+================================================================================
 ```
 
 ---
@@ -152,3 +212,15 @@ make labs-clean
 **Speaker Talking Points:**
 - *"`obs-occupier-job` saturates `team-a-cq`. Then `obs-queued-low` (`priority=100`) is submitted first, followed 2 seconds later by `obs-queued-high` (`priority=1000`)."*
 - *"Querying Kueue's `v1beta2` Visibility API (`/pendingworkloads`) shows `obs-queued-high` jumped to `positionInClusterQueue: 0` ahead of `obs-queued-low` (`positionInClusterQueue: 1`), while Prometheus `:8443/metrics` reports `kueue_cluster_queue_resource_usage=5` and `kueue_pending_workloads=2`."*
+
+---
+
+## Post-Talk Teardown
+
+Once your session concludes, clean up all Kubernetes workloads and destroy the GCP infrastructure:
+
+```bash
+make labs-clean
+make infra-down
+gcloud container clusters list --project=enes-turan-demo
+```

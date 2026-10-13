@@ -78,6 +78,9 @@ gke-kueue-ai-workshop/
 │   ├── 03-labs-step-by-step-guide.md
 │   ├── 04-production-gotchas-and-troubleshooting.md
 │   └── 05-speaker-demo-cheatsheet.md
+├── scripts/                                            # Automated pre-flight & E2E verification suite
+│   ├── preflight-check.sh                              # 15-second 14-point cluster readiness check
+│   └── smoke-test-all.sh                               # Automated 9-lab end-to-end regression suite
 ├── terraform/                                          # LAYER 1: Pure GCP Cloud Infrastructure
 │   ├── versions.tf                                     # hashicorp/google (~> 6.0) only
 │   ├── variables.tf                                    # Project, Region, Zone, Cluster variables
@@ -120,14 +123,17 @@ make infra-up          # Provision VPC, GKE cluster, and 4 node pools (~9 mins)
 make kubeconfig        # Configure local ~/.kube/config
 make operators-install # Install JobSet (v0.10.1), LWS (v0.11.1) & Kueue (v0.16.2) on system-pool
 make base-apply        # Apply Namespaces, PyTorch ConfigMaps, CEL Governance, and Kueue v1beta2 setup
+make preflight         # Run 15-second 14-point pre-flight health check across nodes, operators & queues
 make status            # Inspect Nodes, Topology labels, Queues, and AdmissionChecks
 ```
 
-### 2. Run the 9 Hands-On Labs
+### 2. Run the 9 Hands-On Labs (Individually or Automated E2E Suite)
 See **[`docs/03-labs-step-by-step-guide.md`](docs/03-labs-step-by-step-guide.md)** for full walkthroughs and verified outputs:
 
 | Target | Lab Scenario | Key Capability Demonstrated |
 | :--- | :--- | :--- |
+| **`make preflight`** | **Pre-Flight Check** | Runs [`scripts/preflight-check.sh`](scripts/preflight-check.sh) to verify node topology labels, free allocatable CPU ($\ge 3000\text{m}$), operator webhooks, Kueue `v1beta2` queues, CEL policies, and observability endpoints. |
+| **`make test-all`** | **9-Lab E2E Smoke Suite** | Runs [`scripts/smoke-test-all.sh`](scripts/smoke-test-all.sh) to execute and assert all 9 hands-on labs end-to-end with a pass/fail summary table. |
 | **`make lab1`** | **Gang Scheduling** | Submits $2 \times 4\text{ vCPU}$ PyTorch DDP `JobSet`s against a $6\text{ vCPU}$ effective On-Demand quota; admits JobSet 1 ($2/2$ Pods) and holds JobSet 2 suspended until JobSet 1 finishes. |
 | **`make lab2`** | **Topology Aware Scheduling (TAS)** | Uses `kueue.x-k8s.io/podset-required-topology: "workshop.ai/topology-rack"` to force both worker Pods ($2 \times 1200\text{m}$) onto the **exact same rack node**. |
 | **`make lab3`** | **Atomic Spot Scale-Up (DWS Sim)** | Submits a $7.5\text{ vCPU}$ ($3 \times 2500\text{m}$) `JobSet` that spills over to `spot-flavor`, triggers a GKE `ProvisioningRequest` (`best-effort-atomic-scale-up.autoscaling.x-k8s.io`), and scales `spot-atomic-pool` from `0 -> 3` Spot nodes atomically. |
