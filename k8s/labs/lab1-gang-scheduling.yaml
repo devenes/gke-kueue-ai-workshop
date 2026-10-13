@@ -1,0 +1,57 @@
+# k8s/labs/lab1-gang-scheduling.yaml
+# Submit twice with: kubectl create -f k8s/labs/lab1-gang-scheduling.yaml
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: pytorch-ddp-gang-
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: team-a-queue
+spec:
+  replicatedJobs:
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        parallelism: 2
+        completions: 2
+        template:
+          metadata:
+            annotations:
+              # Allow the 2 pods (4 vCPUs total) to span across rack-1 and rack-2 within block-1
+              kueue.x-k8s.io/podset-preferred-topology: "workshop.ai/topology-block"
+          spec:
+            restartPolicy: Never
+            containers:
+            - name: pytorch
+              image: pytorch/torchserve:0.12.0-cpu
+              command:
+              - bash
+              - -c
+              - |
+                MASTER_ADDR="$(hostname | sed 's/-[0-9]*$/-0/').$(hostname -d)"
+                torchrun \
+                  --nnodes=2 \
+                  --nproc_per_node=1 \
+                  --node_rank=$JOB_COMPLETION_INDEX \
+                  --master_addr=$MASTER_ADDR \
+                  --master_port=29500 \
+                  /workspace/train.py
+              env:
+              - name: NODE_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: spec.nodeName
+              - name: EPOCHS
+                value: "8"
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "2Gi"
+              volumeMounts:
+              - name: script-vol
+                mountPath: /workspace
+            volumes:
+            - name: script-vol
+              configMap:
+                name: pytorch-ddp-script

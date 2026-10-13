@@ -1,0 +1,50 @@
+# k8s/labs/lab3-spot-atomic.yaml
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: pytorch-spot-atomic-scaleup
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: team-a-queue
+spec:
+  replicatedJobs:
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        parallelism: 3
+        completions: 3
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+            - name: pytorch
+              image: pytorch/torchserve:0.12.0-cpu
+              command:
+              - bash
+              - -c
+              - |
+                torchrun \
+                  --nnodes=3 \
+                  --nproc_per_node=1 \
+                  --node_rank=$JOB_COMPLETION_INDEX \
+                  --master_addr=pytorch-spot-atomic-scaleup-workers-0-0.pytorch-spot-atomic-scaleup \
+                  --master_port=29500 \
+                  /workspace/train.py
+              env:
+              - name: NODE_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: spec.nodeName
+              resources:
+                requests:
+                  # 3 pods x 2.5 vCPU = 7.5 vCPUs (> 6 vCPU on-demand quota -> spills over to spot-flavor)
+                  cpu: "2500m"
+                  memory: "3Gi"
+              volumeMounts:
+              - name: script-vol
+                mountPath: /workspace
+            volumes:
+            - name: script-vol
+              configMap:
+                name: pytorch-ddp-script

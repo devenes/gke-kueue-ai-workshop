@@ -1,0 +1,114 @@
+# k8s/labs/lab4-preemption.yaml
+# 1. Low-Priority Research Workload (5 vCPUs total, long-running: 50 epochs)
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: research-long-training
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: team-a-queue
+    kueue.x-k8s.io/priority-class: low-research-priority
+spec:
+  replicatedJobs:
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        parallelism: 2
+        completions: 2
+        template:
+          metadata:
+            annotations:
+              kueue.x-k8s.io/podset-preferred-topology: "workshop.ai/topology-block"
+          spec:
+            restartPolicy: Never
+            containers:
+            - name: pytorch
+              image: pytorch/torchserve:0.12.0-cpu
+              command:
+              - bash
+              - -c
+              - |
+                torchrun \
+                  --nnodes=2 \
+                  --nproc_per_node=1 \
+                  --node_rank=$JOB_COMPLETION_INDEX \
+                  --master_addr=research-long-training-workers-0-0.research-long-training \
+                  --master_port=29500 \
+                  /workspace/train.py
+              env:
+              - name: NODE_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: spec.nodeName
+              - name: EPOCHS
+                value: "50"
+              resources:
+                requests:
+                  cpu: "2500m"
+                  memory: "2Gi"
+              volumeMounts:
+              - name: script-vol
+                mountPath: /workspace
+            volumes:
+            - name: script-vol
+              configMap:
+                name: pytorch-ddp-script
+---
+# 2. High-Priority Production Workload (5 vCPUs total, requires on-demand TAS block)
+# Preempts 'research-long-training' on the on-demand-flavor pool
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: urgent-prod-training
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: team-a-queue
+    kueue.x-k8s.io/priority-class: high-prod-priority
+spec:
+  replicatedJobs:
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        parallelism: 2
+        completions: 2
+        template:
+          metadata:
+            annotations:
+              # Requires TAS topology -> forces placement onto on-demand-flavor and preempts lower-priority workload
+              kueue.x-k8s.io/podset-required-topology: "workshop.ai/topology-block"
+          spec:
+            restartPolicy: Never
+            containers:
+            - name: pytorch
+              image: pytorch/torchserve:0.12.0-cpu
+              command:
+              - bash
+              - -c
+              - |
+                torchrun \
+                  --nnodes=2 \
+                  --nproc_per_node=1 \
+                  --node_rank=$JOB_COMPLETION_INDEX \
+                  --master_addr=urgent-prod-training-workers-0-0.urgent-prod-training \
+                  --master_port=29500 \
+                  /workspace/train.py
+              env:
+              - name: NODE_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: spec.nodeName
+              - name: EPOCHS
+                value: "4"
+              resources:
+                requests:
+                  cpu: "2500m"
+                  memory: "2Gi"
+              volumeMounts:
+              - name: script-vol
+                mountPath: /workspace
+            volumes:
+            - name: script-vol
+              configMap:
+                name: pytorch-ddp-script
