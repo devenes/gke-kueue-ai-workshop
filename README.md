@@ -31,7 +31,7 @@ Normally, testing features like **Topology Aware Scheduling (TAS)**, **Dynamic W
 
 ---
 
-## 📚 Documentation Index (`docs/`)
+## 📚 Documentation Index
 
 Start here for deep-dive architectural guides, capacity engineering math, live GKE `v1.36` field notes, and speaker runbooks:
 
