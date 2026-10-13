@@ -205,3 +205,138 @@ data:
 
     if __name__ == "__main__":
         main()
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pytorch-checkpoint-script
+  namespace: team-a
+data:
+  train_checkpoint.py: |
+    import os
+    import signal
+    import socket
+    import sys
+    import time
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    preempted_flag = False
+
+    def handle_preemption(signum, frame):
+        global preempted_flag
+        preempted_flag = True
+
+    signal.signal(signal.SIGTERM, handle_preemption)
+    signal.signal(signal.SIGINT, handle_preemption)
+
+    def save_checkpoint_atomic(ckpt_path, rank, epoch, model, optimizer):
+        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+        tmp_path = f"{ckpt_path}.rank{rank}.tmp"
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+        }, tmp_path)
+        os.replace(tmp_path, ckpt_path)
+
+    def main():
+        dist.init_process_group(backend="gloo")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        node_name = os.environ.get("NODE_NAME", socket.gethostname())
+        ckpt_path = os.environ.get("CHECKPOINT_PATH", "/var/tmp/kueue-checkpoints/lab7_ckpt.pt")
+        epochs = int(os.environ.get("EPOCHS", "8"))
+
+        print(f"[Rank {rank}/{world_size}] Initialized on Node: {node_name} | Checkpoint Path: {ckpt_path}", flush=True)
+
+        torch.manual_seed(42)
+        model = nn.Sequential(nn.Linear(512, 256), nn.ReLU(), nn.Linear(256, 10))
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+
+        loaded_epoch = 0
+        if os.path.exists(ckpt_path):
+            try:
+                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                loaded_epoch = int(ckpt.get("epoch", 0))
+                model.load_state_dict(ckpt["model_state_dict"])
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except Exception as exc:
+                print(f"[Rank {rank}] Warning: Failed to read local checkpoint ({exc}), starting from 0", flush=True)
+                loaded_epoch = 0
+
+        local_epoch_tensor = torch.tensor([loaded_epoch], dtype=torch.int64)
+        dist.all_reduce(local_epoch_tensor, op=dist.ReduceOp.MAX)
+        synced_epoch = int(local_epoch_tensor.item())
+
+        ddp_model = DDP(model)
+        loss_fn = nn.CrossEntropyLoss()
+
+        if rank == 0:
+            if synced_epoch > 0:
+                print(
+                    f"🔄 [RESUMED FROM CHECKPOINT] Found saved state at Epoch {synced_epoch}! "
+                    f"Resuming training from Epoch {synced_epoch + 1}/{epochs} (Zero Goodput Lost!)",
+                    flush=True,
+                )
+            else:
+                print(f"🆕 [FRESH START] No checkpoint found. Starting from Epoch 1/{epochs}", flush=True)
+
+        last_completed_epoch = synced_epoch
+        for epoch in range(synced_epoch + 1, epochs + 1):
+            if preempted_flag:
+                break
+
+            optimizer.zero_grad()
+            inputs = torch.randn(64, 512)
+            labels = torch.randint(0, 10, (64,))
+            outputs = ddp_model(inputs)
+            loss = loss_fn(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            save_checkpoint_atomic(ckpt_path, rank, epoch, ddp_model.module, optimizer)
+            last_completed_epoch = epoch
+
+            if rank == 0:
+                print(
+                    f"Epoch [{epoch}/{epochs}] | World Size: {world_size} | Loss: {loss.item():.4f} "
+                    f"| 💾 Checkpoint saved ({ckpt_path})",
+                    flush=True,
+                )
+
+            for _ in range(8):
+                if preempted_flag:
+                    break
+                time.sleep(0.5)
+
+            if preempted_flag:
+                break
+
+        if preempted_flag:
+            save_checkpoint_atomic(ckpt_path, rank, last_completed_epoch, ddp_model.module, optimizer)
+            print(
+                f"⚠️ [SIGTERM RECEIVED] [Rank {rank}] Kueue preemption detected! "
+                f"Persisting checkpoint at Epoch {last_completed_epoch} to {ckpt_path} and exiting gracefully...",
+                flush=True,
+            )
+            sys.stdout.flush()
+            dist.destroy_process_group()
+            sys.exit(0)
+
+        if last_completed_epoch >= epochs:
+            if os.path.exists(ckpt_path):
+                try:
+                    os.remove(ckpt_path)
+                except OSError:
+                    pass
+            if rank == 0:
+                print(f"🎉 Distributed Training Completed All {epochs} Epochs Successfully! (Cleaned up {ckpt_path})", flush=True)
+
+        dist.destroy_process_group()
+
+    if __name__ == "__main__":
+        main()

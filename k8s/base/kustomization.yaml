@@ -5,3 +5,4 @@ resources:
   - namespaces.yaml
   - pytorch-ddp-configmap.yaml
   - kueue-setup.yaml
+  - governance-policy.yaml

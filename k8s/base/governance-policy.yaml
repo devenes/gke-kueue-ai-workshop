@@ -1,0 +1,45 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: require-kueue-queue-name
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["jobset.x-k8s.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE"]
+        resources: ["jobsets"]
+      - apiGroups: ["leaderworkerset.x-k8s.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE"]
+        resources: ["leaderworkersets"]
+  validations:
+    - expression: "has(object.metadata.labels) && 'kueue.x-k8s.io/queue-name' in object.metadata.labels && object.metadata.labels['kueue.x-k8s.io/queue-name'].size() > 0"
+      message: "Platform Governance Policy Violation: All JobSet and LeaderWorkerSet workloads in Kueue-managed namespaces MUST specify a non-empty 'kueue.x-k8s.io/queue-name' label."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: require-kueue-queue-name-binding
+spec:
+  policyName: require-kueue-queue-name
+  validationActions:
+    - Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kueue-governance: "enforced"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kueue-metrics-reader-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kueue-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: kueue-controller-manager
+    namespace: kueue-system
