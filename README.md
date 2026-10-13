@@ -11,7 +11,7 @@
 [![Terraform](https://img.shields.io/badge/Terraform-%3E%3D_1.6-844FBA?logo=terraform&logoColor=white)](https://www.terraform.io/)
 [![Cost](https://img.shields.io/badge/Cloud_Cost-~%240.40%2Fhr_(Zero_GPU)-2EA44F)](#architecture-overview)
 
-[**Quickstart**](#-quickstart) • [**Architecture**](#-architecture-overview) • [**9 Hands-On Labs**](#-the-9-hands-on-labs) • [**Documentation (`docs/`)**](#-documentation-index-docs) • [**Speaker Runbook**](docs/05-speaker-demo-cheatsheet.md)
+[**Quickstart**](#-quickstart) • [**9 Hands-On Labs**](#-the-9-hands-on-labs) • [**Documentation (`docs/`)**](#-documentation-index-docs) • [**Speaker Runbook**](docs/05-speaker-demo-cheatsheet.md)
 
 </div>
 
