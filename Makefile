@@ -9,7 +9,7 @@ KUEUE_VERSION  ?= 0.16.2
 
 .DEFAULT_GOAL := help
 
-.PHONY: help infra-init infra-plan infra-up infra-down kubeconfig operators-install base-apply status lab1 lab2 lab3 lab4 lab5 lab6 labs-clean
+.PHONY: help infra-init infra-plan infra-up infra-down kubeconfig operators-install base-apply status lab1 lab2 lab3 lab4 lab5 lab6 lab7 lab8 lab9 labs-clean
 
 help: ## Show available workshop Make targets
 	@echo "================================================================================"
@@ -58,6 +58,11 @@ operators-install: ## Install JobSet, LWS, and Kueue operators via official Helm
 			--create-namespace \
 			--set controllerManager.nodeSelector.workload=system \
 			--wait
+	@kubectl get configmap kueue-manager-config -n kueue-system -o json | \
+		python3 -c 'import sys, json; cm=json.load(sys.stdin); cfg=cm["data"]["controller_manager_config.yaml"]; cm["data"]["controller_manager_config.yaml"]=cfg.replace("bindAddress: :8443", "bindAddress: :8443\n  enableClusterQueueResources: true") if "enableClusterQueueResources" not in cfg else cfg; json.dump(cm, sys.stdout)' | \
+		kubectl apply -f -
+	kubectl rollout restart deployment/kueue-controller-manager -n kueue-system
+	kubectl rollout status deployment/kueue-controller-manager -n kueue-system --timeout=90s
 
 base-apply: ## Apply Namespaces, PyTorch DDP/LWS ConfigMaps, and Kueue v1beta2 setup via Kustomize
 	kubectl apply -k k8s/base
@@ -105,6 +110,51 @@ lab5: ## Run Lab 5: Multi-Team Cohort Quota Borrowing (team-a) & Fair-Share Recl
 
 lab6: ## Run Lab 6: Distributed Multi-Pod Inference with LeaderWorkerSet (LWS) & Cross-PodSet TAS
 	kubectl apply -f k8s/labs/lab6-lws-inference-tas.yaml
+
+lab7: ## Run Lab 7: Stateful DDP Checkpointing & Graceful Preemption Resume (Zero Goodput Lost)
+	awk '/^---$$/{exit} {print}' k8s/labs/lab7-checkpoint-resume.yaml | kubectl apply -f -
+	@echo "Waiting for resumable-research-job pods to start running..."
+	sleep 5
+	kubectl wait --for=condition=Ready pod -l jobset.sigs.k8s.io/jobset-name=resumable-research-job -n team-a --timeout=90s
+	@echo "Allowing resumable-research-job to complete ~3 epochs and persist checkpoints..."
+	sleep 14
+	@echo "=== Pre-Preemption Logs (resumable-research-job Rank 0) ==="
+	kubectl logs -l jobset.sigs.k8s.io/jobset-name=resumable-research-job,batch.kubernetes.io/job-completion-index=0 -n team-a
+	@echo "\nSubmitting urgent-checkpoint-preemptor (priority=1000) to preempt resumable-research-job..."
+	awk 'f{print} /^---$$/{f=1}' k8s/labs/lab7-checkpoint-resume.yaml | kubectl apply -f -
+
+lab8: ## Run Lab 8: CEL ValidatingAdmissionPolicy Governance & Max-Exec-Time SLA Enforcement
+	@echo "=== Step 8A: Attempting to submit unlabeled-rogue-jobset (omits kueue.x-k8s.io/queue-name) ==="
+	@awk '/^---$$/{exit} {print}' k8s/labs/lab8-governance-and-max-exec.yaml | kubectl apply -f - || \
+		echo "✅ CEL ValidatingAdmissionPolicy successfully blocked the unlabeled rogue workload!"
+	@echo "\n=== Step 8B: Submitting sla-time-bounded-job (kueue.x-k8s.io/max-exec-time-seconds: 20) ==="
+	awk 'f{print} /^---$$/{f=1}' k8s/labs/lab8-governance-and-max-exec.yaml | kubectl apply -f -
+	sleep 4
+	@echo "=== Workload Admitted with spec.maximumExecutionTimeSeconds=20 ==="
+	kubectl get workloads -n team-a -o 'custom-columns=NAME:.metadata.name,QUEUE:.spec.queueName,MAX_EXEC_SEC:.spec.maximumExecutionTimeSeconds,ACTIVE:.spec.active,ADMITTED:.status.conditions[?(@.type=="Admitted")].status'
+	@echo "Waiting ~25s for 20-second SLA lease to expire and Kueue to auto-evict the runaway job..."
+	sleep 25
+	@echo "=== Workload Status After 20s SLA Expiration (MaximumExecutionTimeExceeded -> Active=false) ==="
+	kubectl get workloads -n team-a -o 'custom-columns=NAME:.metadata.name,ACTIVE:.spec.active,EVICTED_REASON:.status.conditions[?(@.type=="Evicted")].reason,MESSAGE:.status.conditions[?(@.type=="Evicted")].message'
+
+lab9: ## Run Lab 9: Kueue On-Demand Visibility API (Pending Queue Order) & Prometheus Metrics
+	@echo "=== Step 9A: Submitting obs-occupier-job (5 vCPU) to saturate team-a-cq on-demand quota ==="
+	awk 'BEGIN{doc=0} /^---$$/{doc++; next} doc==0{print}' k8s/labs/lab9-visibility-and-metrics.yaml | kubectl apply -f -
+	sleep 3
+	@echo "=== Step 9B: Submitting obs-queued-low (priority=100) followed by obs-queued-high (priority=1000) ==="
+	awk 'BEGIN{doc=0} /^---$$/{doc++; next} doc==1{print}' k8s/labs/lab9-visibility-and-metrics.yaml | kubectl apply -f -
+	sleep 2
+	awk 'BEGIN{doc=0} /^---$$/{doc++; next} doc==2{print}' k8s/labs/lab9-visibility-and-metrics.yaml | kubectl apply -f -
+	sleep 3
+	@echo "\n=== Step 9C: Kueue Visibility API (v1beta2 PendingWorkloadsSummary on team-a-queue) ==="
+	kubectl get --raw "/apis/visibility.kueue.x-k8s.io/v1beta2/namespaces/team-a/localqueues/team-a-queue/pendingworkloads" | python3 -m json.tool
+	@echo "\n=== Step 9D: Scraping Kueue Prometheus Metrics (/metrics on :8443) ==="
+	@TOKEN=$$(kubectl create token kueue-controller-manager -n kueue-system); \
+	kubectl port-forward svc/kueue-controller-manager-metrics-service -n kueue-system 18443:8443 >/dev/null 2>&1 & \
+	PF_PID=$$!; sleep 2; \
+	curl -sk -H "Authorization: Bearer $$TOKEN" https://127.0.0.1:18443/metrics | \
+		grep -E '^kueue_(pending_workloads|admitted_workloads_total|cluster_queue_resource_usage|cluster_queue_nominal_quota|evicted_workloads_total)\{.*team-a-cq.*replica_role="leader"'; \
+	kill $$PF_PID 2>/dev/null || true
 
 labs-clean: ## Delete all lab JobSets and LeaderWorkerSets in namespaces team-a and team-b
 	kubectl delete jobsets,leaderworkersets --all -n team-a --ignore-not-found --wait=true
