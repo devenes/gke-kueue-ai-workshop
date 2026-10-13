@@ -64,50 +64,6 @@ flowchart TB
 
 ---
 
-## Repository Structure
-
-```text
-gke-kueue-ai-workshop/
-├── .gitignore
-├── LICENSE
-├── Makefile                                            # Self-documenting workflow orchestration
-├── README.md                                           # Workshop overview & quickstart
-├── docs/                                               # Zero-to-advanced documentation suite
-│   ├── 01-concepts-and-architecture.md
-│   ├── 02-infrastructure-and-capacity-math.md
-│   ├── 03-labs-step-by-step-guide.md
-│   ├── 04-production-gotchas-and-troubleshooting.md
-│   └── 05-speaker-demo-cheatsheet.md
-├── scripts/                                            # Automated pre-flight & E2E verification suite
-│   ├── preflight-check.sh                              # 15-second 14-point cluster readiness check
-│   └── smoke-test-all.sh                               # Automated 9-lab end-to-end regression suite
-├── terraform/                                          # LAYER 1: Pure GCP Cloud Infrastructure
-│   ├── versions.tf                                     # hashicorp/google (~> 6.0) only
-│   ├── variables.tf                                    # Project, Region, Zone, Cluster variables
-│   ├── network_iam.tf                                  # GCP APIs, Custom VPC, Subnet, Node SA
-│   ├── gke.tf                                          # Zonal GKE Cluster + 4 Node Pools
-│   └── outputs.tf                                      # Cluster info & gcloud kubeconfig command
-└── k8s/                                                # LAYER 2: Operators, Kustomize & Labs
-    ├── base/
-    │   ├── kustomization.yaml                          # Unified entrypoint for base K8s resources
-    │   ├── namespaces.yaml                             # team-a & team-b (kueue-governance=enforced)
-    │   ├── pytorch-ddp-configmap.yaml                  # PyTorch DDP, Checkpointing & LWS TP scripts
-    │   ├── kueue-setup.yaml                            # Kueue v1beta2 Topology, Flavors, Cohort Queues, DWS
-    │   └── governance-policy.yaml                      # CEL ValidatingAdmissionPolicy & Metrics RBAC
-    └── labs/
-        ├── lab1-gang-scheduling.yaml                   # Lab 1: All-or-Nothing Gang Admission
-        ├── lab2-tas-rack.yaml                          # Lab 2: Topology Aware Scheduling (Same Rack)
-        ├── lab3-spot-atomic.yaml                       # Lab 3: Spot Spillover & Atomic Scale-Up
-        ├── lab4-preemption.yaml                        # Lab 4: Intra-Queue Priority Preemption
-        ├── lab5-cohort-borrowing.yaml                  # Lab 5: Multi-Team Cohort Borrowing & Reclamation
-        ├── lab6-lws-inference-tas.yaml                 # Lab 6: LeaderWorkerSet Inference & Cross-PodSet TAS
-        ├── lab7-checkpoint-resume.yaml                 # Lab 7: Stateful DDP Checkpointing & Preemption Resume
-        ├── lab8-governance-and-max-exec.yaml           # Lab 8: CEL Admission Governance & Max-Exec-Time SLA
-        └── lab9-visibility-and-metrics.yaml            # Lab 9: Kueue Visibility API & Prometheus Metrics
-```
-
----
-
 ## Quickstart
 
 ### Prerequisites
