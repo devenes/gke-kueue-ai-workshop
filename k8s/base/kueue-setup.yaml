@@ -1,0 +1,108 @@
+# 1. TAS Topology (Matches node labels assigned in Terraform)
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Topology
+metadata:
+  name: gke-dc-topology
+spec:
+  levels:
+  - nodeLabel: "workshop.ai/topology-block"
+  - nodeLabel: "workshop.ai/topology-rack"
+  - nodeLabel: "kubernetes.io/hostname"
+---
+# 2. On-Demand ResourceFlavor (TAS enabled)
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: on-demand-flavor
+spec:
+  nodeLabels:
+    tier: on-demand
+  topologyName: gke-dc-topology
+---
+# 3. Spot ResourceFlavor (With taint toleration)
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: spot-flavor
+spec:
+  nodeLabels:
+    tier: spot
+  tolerations:
+  - key: "spot-only"
+    operator: "Equal"
+    value: "true"
+    effect: "NoSchedule"
+---
+# 4. GKE Atomic ProvisioningRequest (DWS CPU Simulation)
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ProvisioningRequestConfig
+metadata:
+  name: gke-atomic-cpu-config
+spec:
+  provisioningClassName: best-effort-atomic-scale-up.autoscaling.x-k8s.io
+  managedResources:
+  - cpu
+  - memory
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: AdmissionCheck
+metadata:
+  name: spot-atomic-check
+spec:
+  controllerName: kueue.x-k8s.io/provisioning-request
+  parameters:
+    apiGroup: kueue.x-k8s.io
+    kind: ProvisioningRequestConfig
+    name: gke-atomic-cpu-config
+---
+# 5. WorkloadPriorityClasses (For Preemption)
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: low-research-priority
+value: 100
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: high-prod-priority
+value: 1000
+---
+# 6. ClusterQueue and LocalQueue
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: team-a-cq
+spec:
+  namespaceSelector: {}
+  cohortName: "ai-org-cohort"
+  preemption:
+    reclaimWithinCohort: Any
+    withinClusterQueue: LowerPriority
+  admissionChecksStrategy:
+    admissionChecks:
+    - name: spot-atomic-check
+      onFlavors: ["spot-flavor"]
+  resourceGroups:
+  - coveredResources: ["cpu", "memory"]
+    flavors:
+    - name: "on-demand-flavor"
+      resources:
+      - name: "cpu"
+        nominalQuota: "6"
+      - name: "memory"
+        nominalQuota: "16Gi"
+    - name: "spot-flavor"
+      resources:
+      - name: "cpu"
+        nominalQuota: "9"
+      - name: "memory"
+        nominalQuota: "24Gi"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: team-a-queue
+  namespace: team-a
+spec:
+  clusterQueue: team-a-cq
