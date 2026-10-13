@@ -1,0 +1,124 @@
+# k8s/labs/lab7-checkpoint-resume.yaml
+# 1. Stateful Resumable Low-Priority Research Workload (5 vCPUs total, 8 epochs, saves atomic DDP checkpoints)
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: resumable-research-job
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: team-a-queue
+    kueue.x-k8s.io/priority-class: low-research-priority
+spec:
+  replicatedJobs:
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        parallelism: 2
+        completions: 2
+        template:
+          metadata:
+            annotations:
+              kueue.x-k8s.io/podset-preferred-topology: "workshop.ai/topology-block"
+          spec:
+            terminationGracePeriodSeconds: 15
+            restartPolicy: Never
+            securityContext:
+              runAsUser: 0
+            containers:
+            - name: pytorch
+              image: pytorch/torchserve:0.12.0-cpu
+              command:
+              - bash
+              - -c
+              - |
+                exec torchrun \
+                  --nnodes=2 \
+                  --nproc_per_node=1 \
+                  --node_rank=$JOB_COMPLETION_INDEX \
+                  --master_addr=resumable-research-job-workers-0-0.resumable-research-job \
+                  --master_port=29500 \
+                  /workspace/train_checkpoint.py
+              env:
+              - name: NODE_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: spec.nodeName
+              - name: EPOCHS
+                value: "8"
+              - name: CHECKPOINT_PATH
+                value: "/var/tmp/kueue-checkpoints/lab7_ckpt.pt"
+              resources:
+                requests:
+                  cpu: "2500m"
+                  memory: "2Gi"
+              volumeMounts:
+              - name: script-vol
+                mountPath: /workspace
+              - name: checkpoint-vol
+                mountPath: /var/tmp/kueue-checkpoints
+            volumes:
+            - name: script-vol
+              configMap:
+                name: pytorch-checkpoint-script
+            - name: checkpoint-vol
+              hostPath:
+                path: /var/tmp/kueue-checkpoints
+                type: DirectoryOrCreate
+---
+# 2. High-Priority Preempting Workload (5 vCPUs total, 3 epochs)
+# Preempts 'resumable-research-job' mid-training; once completed, 'resumable-research-job' resumes from its saved epoch!
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: urgent-checkpoint-preemptor
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: team-a-queue
+    kueue.x-k8s.io/priority-class: high-prod-priority
+spec:
+  replicatedJobs:
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        parallelism: 2
+        completions: 2
+        template:
+          metadata:
+            annotations:
+              kueue.x-k8s.io/podset-required-topology: "workshop.ai/topology-block"
+          spec:
+            restartPolicy: Never
+            containers:
+            - name: pytorch
+              image: pytorch/torchserve:0.12.0-cpu
+              command:
+              - bash
+              - -c
+              - |
+                exec torchrun \
+                  --nnodes=2 \
+                  --nproc_per_node=1 \
+                  --node_rank=$JOB_COMPLETION_INDEX \
+                  --master_addr=urgent-checkpoint-preemptor-workers-0-0.urgent-checkpoint-preemptor \
+                  --master_port=29500 \
+                  /workspace/train.py
+              env:
+              - name: NODE_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: spec.nodeName
+              - name: EPOCHS
+                value: "3"
+              resources:
+                requests:
+                  cpu: "2500m"
+                  memory: "2Gi"
+              volumeMounts:
+              - name: script-vol
+                mountPath: /workspace
+            volumes:
+            - name: script-vol
+              configMap:
+                name: pytorch-ddp-script

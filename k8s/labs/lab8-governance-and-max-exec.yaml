@@ -1,0 +1,87 @@
+# k8s/labs/lab8-governance-and-max-exec.yaml
+# 1. Unlabeled Rogue JobSet (Intentionally omits 'kueue.x-k8s.io/queue-name' to test CEL ValidatingAdmissionPolicy rejection)
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: unlabeled-rogue-jobset
+  namespace: team-a
+  labels:
+    app: rogue-bypass-attempt
+spec:
+  replicatedJobs:
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        parallelism: 2
+        completions: 2
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+            - name: pytorch
+              image: pytorch/torchserve:0.12.0-cpu
+              command: ["sleep", "3600"]
+              resources:
+                requests:
+                  cpu: "2500m"
+                  memory: "2Gi"
+---
+# 2. Time-Bounded SLA Workload ('kueue.x-k8s.io/max-exec-time-seconds: "20"')
+# Runs 30 epochs (~150s runtime), exceeding its 20-second execution lease -> automatically evicted & deactivated by Kueue!
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: sla-time-bounded-job
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: team-a-queue
+    kueue.x-k8s.io/priority-class: low-research-priority
+    kueue.x-k8s.io/max-exec-time-seconds: "20"
+spec:
+  replicatedJobs:
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        parallelism: 2
+        completions: 2
+        template:
+          metadata:
+            annotations:
+              kueue.x-k8s.io/podset-preferred-topology: "workshop.ai/topology-block"
+          spec:
+            terminationGracePeriodSeconds: 2
+            restartPolicy: Never
+            containers:
+            - name: pytorch
+              image: pytorch/torchserve:0.12.0-cpu
+              command:
+              - bash
+              - -c
+              - |
+                exec torchrun \
+                  --nnodes=2 \
+                  --nproc_per_node=1 \
+                  --node_rank=$JOB_COMPLETION_INDEX \
+                  --master_addr=sla-time-bounded-job-workers-0-0.sla-time-bounded-job \
+                  --master_port=29500 \
+                  /workspace/train.py
+              env:
+              - name: NODE_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: spec.nodeName
+              - name: EPOCHS
+                value: "30"
+              resources:
+                requests:
+                  cpu: "1500m"
+                  memory: "2Gi"
+              volumeMounts:
+              - name: script-vol
+                mountPath: /workspace
+            volumes:
+            - name: script-vol
+              configMap:
+                name: pytorch-ddp-script
