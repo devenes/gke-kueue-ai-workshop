@@ -1,6 +1,6 @@
-# 03 — Step-by-Step Labs Guide (Labs 1–9)
+# 03 — Step-by-Step Labs Guide (Labs 1–10)
 
-This guide walks through each of the nine hands-on labs in [`k8s/labs/`](../k8s/labs/), explaining the manifest design, internal control-plane flow, execution commands, and verified terminal outputs from GKE `v1.36.4-gke.1391002`.
+This guide walks through each of the ten hands-on labs in [`k8s/labs/`](../k8s/labs/), explaining the manifest design, internal control-plane flow, execution commands, and verified terminal outputs from GKE `v1.36.4-gke.1391002`.
 
 ---
 
@@ -543,3 +543,174 @@ kueue_cluster_queue_resource_usage{cluster_queue="team-a-cq",cohort="ai-org-coho
 kueue_pending_workloads{cluster_queue="team-a-cq",replica_role="leader",status="active"} 0
 kueue_pending_workloads{cluster_queue="team-a-cq",replica_role="leader",status="inadmissible"} 2
 ```
+
+---
+
+## Lab 10: Cloud Storage FUSE CSI, Hierarchical Namespace (HNS), Per-Pod File Cache & Distributed Checkpointing ([`k8s/labs/lab10-gcsfuse-ai-storage.yaml`](../k8s/labs/lab10-gcsfuse-ai-storage.yaml))
+
+### 1. Scenario & Objective
+Production multi-node AI training and inference jobs on GKE use **Google Cloud Storage (GCS)** with **Hierarchical Namespace (HNS)** and the **Cloud Storage FUSE CSI driver (`gcsfuse.csi.storage.gke.io`)** to stage and load model weights and save distributed checkpoints without managing POSIX NFS/Filestore clusters.
+1. **Direct Workload Identity Federation (No GSA Hop):** `ServiceAccount/lab10-gcsfuse-sa` in `team-a` has no `iam.gke.io/gcp-service-account` annotation; Terraform binds `roles/storage.objectUser` on the regional HNS bucket directly to `principal://iam.googleapis.com/projects/697289276442/locations/global/workloadIdentityPools/enes-turan-demo.svc.id.goog/subject/ns/team-a/sa/lab10-gcsfuse-sa`.
+2. **Kueue Admission vs. Post-Webhook GKE Sidecar Accounting:** Kueue evaluates the 3-Pod `JobSet` before Pods exist (`3 × 1250m = 3750m` CPU, `3000m` nominal + `750m` borrowed from `team-b-cq`). When Kueue unsuspends the `JobSet`, GKE's GCS FUSE mutating webhook injects `gke-gcsfuse-sidecar` (`250m` CPU, `512Mi` memory) and `gke-gcsfuse-metadata-prefetch` (`10m` CPU, `10Mi` memory) native sidecars into each Pod, raising actual `kube-scheduler` Pod requests to `3 × 1510m = 4530m` CPU (`+780m` CPU delta). Two Pods co-locate on `on-demand-rack-1` (`3020m` CPU) and one Pod runs on `on-demand-rack-2` (`1510m` CPU).
+3. **Atomic HNS Directory Rename (`os.rename`):** Rank 0 writes an 8-tensor (`[2048, 2048]` `float32`, exact `134,217,728` bytes / `128 MiB` tensor payload) state dict into `/mnt/gcsfuse/runs/<run_id>/staging_v1/model.pt`, flushes/fsyncs, and executes `os.rename(staging_dir, published_dir)` — completing an atomic server-side HNS directory rename in `136.04 ms–142.43 ms`.
+4. **Per-Pod File Cache & `mmap=True` Verification:** All 3 ranks load `published_v1/model.pt` with `torch.load(..., map_location="cpu", weights_only=True, mmap=True)` and touch every single page (`134,217,728` bytes) across Pass 1 (cold read from GCS into per-Pod `/gcsfuse-cache`) and Pass 2 (warm read from local cache, achieving **`4.65x–7.18x` speedup**), proving that even co-located Pods on `rack-1` maintain isolated per-Pod file caches.
+5. **Cross-Rank Distributed Checkpointing:** All 3 ranks write `checkpoints/step_1/rank_{0,1,2}.pt` (`263,772` bytes each), synchronize via `dist.barrier()`, and independently read and cryptographically verify all 3 shards ($3 \times 3 = 9$ validations).
+
+### 2. Manifest & CSI Volume Configuration Breakdown
+
+| Setting / Annotation | Value in [`lab10-gcsfuse-ai-storage.yaml`](../k8s/labs/lab10-gcsfuse-ai-storage.yaml) | Engineering Purpose |
+| :--- | :--- | :--- |
+| `gke-gcsfuse/volumes` | `"true"` | Triggers GKE's mutating admission webhook to inject `gke-gcsfuse-sidecar` and `gke-gcsfuse-metadata-prefetch` as native sidecars (`initContainers` with `restartPolicy: Always`). |
+| `gke-gcsfuse/cpu-request` & `memory-request` | `"250m"` / `"512Mi"` | Right-sizes the `gcsfuse` sidecar so 2 co-located Pods ($2 \times 1510\text{m} = 3020\text{m}$ CPU) fit within a 4-vCPU `e2-standard-4` rack node's `~3198m–3372m` free allocatable CPU. |
+| `gke-gcsfuse/metadata-prefetch-*` | `10m` CPU / `10Mi` Mem / `10Mi` Ephemeral | Right-sizes the metadata prefetch native sidecar (`gke-gcsfuse-metadata-prefetch`). |
+| `csi.driver` | `gcsfuse.csi.storage.gke.io` | Ephemeral inline CSI volume mounted at `/mnt/gcsfuse`. |
+| `volumeAttributes.bucketName` | `"__GCS_AI_BUCKET_NAME__"` | Project-independent placeholder rendered dynamically by `make lab10` from `terraform -chdir=terraform output -raw gcs_ai_bucket_name`. |
+| `volumeAttributes.fileCacheCapacity` | `"512Mi"` | Allocates a `512 MiB` per-Pod file cache in `emptyDir` (`gke-gcsfuse-cache`) inside each Pod's sidecar container (`128 MiB` model fits completely). |
+| `volumeAttributes.fileCacheForRangeRead` | `"true"` | Enables caching for random/range reads triggered by PyTorch `torch.load(..., mmap=True)`. |
+| `volumeAttributes.gcsfuseMetadataPrefetchOnMount` | `"true"` | Prefetches bucket directory/object metadata upon mount. |
+| `volumeAttributes.skipCSIBucketAccessCheck` | `"true"` | Bypasses the CSI node driver's pre-mount `storage.buckets.get` check so least-privilege `roles/storage.objectUser` works without extra bucket-reader roles. |
+| `volumeAttributes.mountOptions` | `implicit-dirs,uid=1000,gid=1000,file-mode=0664,dir-mode=0775,file-cache:enable-parallel-downloads:true` | Mounts files owned by UID/GID `1000` (`model-server`) and enables parallel multi-worker downloads into the per-Pod file cache. |
+
+### 3. Under-the-Hood Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant Make as make lab10
+    participant Kueue as Kueue Queue Manager
+    participant Webhook as GKE GCS FUSE Webhook
+    participant Rank0 as Rank 0 (rack-1)
+    participant Rank1 as Rank 1 (rack-1, co-located)
+    participant Rank2 as Rank 2 (rack-2)
+    participant HNS as GCS HNS Bucket (EUROPE-WEST1)
+
+    Make->>Kueue: 1. Render __GCS_AI_BUCKET_NAME__ & submit JobSet (3x1250m = 3750m CPU)
+    Note over Kueue: Admits 3750m CPU (3000m nominal + 750m borrowed)
+    Kueue->>Webhook: 2. Unsuspend JobSet -> Create 3 Pods
+    Note over Webhook: Injects gke-gcsfuse-sidecar (250m/512Mi) +<br/>metadata-prefetch (10m/10Mi) -> 3x1510m = 4530m CPU
+    Rank0->>HNS: 3. Write 128 MiB staging_v1/model.pt + fsync() (1393.19ms)
+    Rank0->>HNS: 4. Atomic HNS folder rename: os.rename(staging_v1, published_v1) (136.04ms)
+    Note over Rank0,Rank2: dist.barrier() — prevents negative stat cache before publish
+    par Pass 1 (Cold Read -> Per-Pod 512Mi File Cache) & Pass 2 (Warm Read)
+        Rank0->>HNS: torch.load(mmap=True) -> 1190.60ms cold / 252.48ms warm (4.72x)
+        Rank1->>HNS: torch.load(mmap=True) -> 1228.30ms cold / 264.05ms warm (4.65x)
+        Rank2->>HNS: torch.load(mmap=True) -> 1161.93ms cold / 242.16ms warm (4.80x)
+    end
+    par Distributed Checkpoint Shards (checkpoints/step_1/rank_{0,1,2}.pt)
+        Rank0->>HNS: Write rank_0.pt -> Read & verify rank_{0,1,2}.pt (3/3 VALID)
+        Rank1->>HNS: Write rank_1.pt -> Read & verify rank_{0,1,2}.pt (3/3 VALID)
+        Rank2->>HNS: Write rank_2.pt -> Read & verify rank_{0,1,2}.pt (3/3 VALID)
+    end
+```
+
+### 4. Detailed Live GKE Benchmark Test Results
+
+#### A. Model Staging & HNS Atomic Directory Rename (`Rank 0`)
+
+| Metric | Run 1 (`run_20261019_200043_ad58cb19`) | Run 2 (`run_20261019_202022_3334db8a` in `make test-all`) | Verification Status |
+| :--- | :--- | :--- | :--- |
+| **Raw Tensor Payload (`8 × [2048, 2048]` `float32`)** | `134,217,728` bytes (`128.00 MiB`) | `134,217,728` bytes (`128.00 MiB`) | Exact match |
+| **Serialized PyTorch File (`model.pt`)** | `134,220,352` bytes | `134,220,352` bytes | Exact match |
+| **Staging Write + `fsync()` Latency (`write_ms`)** | `1828.48 ms` | `1393.19 ms` | Flushed to GCS HNS |
+| **HNS Atomic Folder Rename (`os.rename`) (`rename_ms`)** | **`142.43 ms`** | **`136.04 ms`** | `staging_exists=False`, `published_exists=True` |
+
+#### B. Per-Pod File Cache Benchmark (`torch.load(..., mmap=True)` + Full Page Materialization)
+
+| Rank & Pod | Physical GKE Node | Run 1 Cold / Warm (`Speedup`) | Run 2 Cold / Warm (`Speedup`) | `float64` Signature | Materialized `SHA-256` Digest (`134,217,728` Bytes) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Rank 0** (`workers-0-0`) | `on-demand-rack-1` (`c61b6249-dzdf`, **co-located**) | `1512.97 ms` $\rightarrow$ `292.08 ms` (**`5.18x`**) | `1190.60 ms` $\rightarrow$ `252.48 ms` (**`4.72x`**) | `8474.860089` | `b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9` |
+| **Rank 1** (`workers-0-1`) | `on-demand-rack-1` (`c61b6249-dzdf`, **co-located**) | `1784.02 ms` $\rightarrow$ `248.48 ms` (**`7.18x`**) | `1228.30 ms` $\rightarrow$ `264.05 ms` (**`4.65x`**) | `8474.860089` | `b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9` |
+| **Rank 2** (`workers-0-2`) | `on-demand-rack-2` (`baf4d2e8-w3mc`, **sole pod**) | `1305.66 ms` $\rightarrow$ `234.80 ms` (**`5.56x`**) | `1161.93 ms` $\rightarrow$ `242.16 ms` (**`4.80x`**) | `8474.860089` | `b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9` |
+
+#### C. Cross-Rank Distributed Checkpoint Shards (`checkpoints/step_1/rank_{0,1,2}.pt`)
+
+| Checkpoint Shard | Writer Rank & Node | File Size | Write + `fsync()` Latency | Shard Tensor `SHA-256` Digest | Cross-Rank Readers Verified |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `rank_0.pt` | Rank 0 (`on-demand-rack-1`) | `263,772` bytes | `127.04 ms` | `376a3ea2c1fc485ab30c3f8e5db5c453c8f8c64ebb11286ece8fdf8e52f50937` | Ranks `0, 1, 2` (`3/3 VALID`) |
+| `rank_1.pt` | Rank 1 (`on-demand-rack-1`) | `263,772` bytes | `174.92 ms` | `b59808c851b91a1d095d9701fccfe0220de42031f25e74b632ae71deb03f6997` | Ranks `0, 1, 2` (`3/3 VALID`) |
+| `rank_2.pt` | Rank 2 (`on-demand-rack-2`) | `263,772` bytes | `167.94 ms` | `af4546870c7bd41c1b5e80487f28e9b530efac6bbe3cc038ef46307186f61de1` | Ranks `0, 1, 2` (`3/3 VALID`) |
+
+### 5. Execution & Verification Commands
+```bash
+# Resolves Terraform HNS bucket output, renders manifest, audits Kueue vs. sidecar CPU/Mem, and verifies logs
+make lab10
+
+# Inspect GCSFuse sidecar logs (verifies gcsfuse/3.11.2-gke.0 HNS auto-detection & 512 MB file cache)
+kubectl logs -n team-a -l jobset.sigs.k8s.io/jobset-name=lab10-gcsfuse-ai-storage -c gke-gcsfuse-sidecar --prefix=true --tail=20
+
+# Clean up transient Kubernetes JobSet
+make labs-clean
+```
+
+### 6. Verified Live GKE Output
+
+#### A. `make lab10` Complete Execution Output (`run_20261019_202022_3334db8a`)
+```text
+=== Step 10A: Resolving HNS Bucket Name from Terraform Output ===
+Resolved Terraform HNS Bucket: gs://enes-turan-demo-kueue-ai-storage (Project: enes-turan-demo)
+=== Step 10B: Applying Rendered Lab 10 Manifest (ServiceAccount + 3-Rank JobSet) ===
+serviceaccount/lab10-gcsfuse-sa unchanged
+jobset.jobset.x-k8s.io/lab10-gcsfuse-ai-storage created
+=== Step 10C: Waiting for Kueue Workload Admission & Pod Creation ===
+workload.kueue.x-k8s.io/jobset-lab10-gcsfuse-ai-storage-6ff21 condition met
+=== Step 10D: Kueue Declared Quota vs. Post-Webhook GKE Sidecar Resource Audit ===
+Kueue Workload (jobset-lab10-gcsfuse-ai-storage-6ff21): 3 pods x (1250m CPU, 1536Mi Mem) = 3750m CPU, 4608Mi Mem
+ClusterQueue team-a-cq Reservation: [{"name": "on-demand-flavor", "resources": [{"borrowed": "750m", "name": "cpu", "total": "3750m"}, {"borrowed": "0", "name": "memory", "total": "4608Mi"}]}, {"name": "spot-flavor", "resources": [{"borrowed": "0", "name": "cpu", "total": "0"}, {"borrowed": "0", "name": "memory", "total": "0"}]}]
+  Pod lab10-gcsfuse-ai-storage-workers-0-0-w9xdb on gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf: effective=1510m CPU, 2058Mi Mem -> gke-gcsfuse-sidecar[init-sidecar](250m,512Mi), gke-gcsfuse-metadata-prefetch[init-sidecar](10m,10Mi), pytorch(1250m,1536Mi)
+  Pod lab10-gcsfuse-ai-storage-workers-0-1-bjfff on gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf: effective=1510m CPU, 2058Mi Mem -> gke-gcsfuse-sidecar[init-sidecar](250m,512Mi), gke-gcsfuse-metadata-prefetch[init-sidecar](10m,10Mi), pytorch(1250m,1536Mi)
+  Pod lab10-gcsfuse-ai-storage-workers-0-2-spml2 on gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc: effective=1510m CPU, 2058Mi Mem -> gke-gcsfuse-sidecar[init-sidecar](250m,512Mi), gke-gcsfuse-metadata-prefetch[init-sidecar](10m,10Mi), pytorch(1250m,1536Mi)
+Post-Webhook Total Across 3 Pods: 4530m CPU, 6174Mi Mem (Delta: +780m CPU, +1566Mi Mem)
+Physical Node Placement Distribution: {'gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf': 2, 'gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc': 1}
+=== Step 10E: Waiting for 3-Rank Distributed Benchmark JobSet Completion ===
+jobset.jobset.x-k8s.io/lab10-gcsfuse-ai-storage condition met
+=== Step 10F: Distributed Benchmark Logs & Integrity Verification ===
+[pod/lab10-gcsfuse-ai-storage-workers-0-0-w9xdb/pytorch] [INIT] rank=0/3 pod=lab10-gcsfuse-ai-storage-workers-0-0-w9xdb node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf run_id=run_20261019_202022_3334db8a mount_path=/mnt/gcsfuse
+[pod/lab10-gcsfuse-ai-storage-workers-0-0-w9xdb/pytorch] [HNS_RENAME] rank=0 pod=lab10-gcsfuse-ai-storage-workers-0-0-w9xdb node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf write_ms=1393.19 rename_ms=136.04 staging_exists=False published_exists=True tensor_payload_bytes=134217728 serialized_bytes=134220352
+[pod/lab10-gcsfuse-ai-storage-workers-0-0-w9xdb/pytorch] [CACHE_BENCH] rank=0 pod=lab10-gcsfuse-ai-storage-workers-0-0-w9xdb node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf cold_ms=1190.60 warm_ms=252.48 speedup=4.72x tensor_payload_bytes=134217728 numeric_sig=8474.860089 sha256=b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9
+[pod/lab10-gcsfuse-ai-storage-workers-0-0-w9xdb/pytorch] [MODEL_VERIFY] rank=0 all_ranks_sha256_match=True sha256=b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9 tensor_payload_bytes=134217728 verified_ranks=3
+[pod/lab10-gcsfuse-ai-storage-workers-0-0-w9xdb/pytorch] [CKPT_WRITE] rank=0 pod=lab10-gcsfuse-ai-storage-workers-0-0-w9xdb node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf path=/mnt/gcsfuse/runs/run_20261019_202022_3334db8a/checkpoints/step_1/rank_0.pt bytes=263772 write_ms=127.04 shard_sha256=376a3ea2c1fc485ab30c3f8e5db5c453c8f8c64ebb11286ece8fdf8e52f50937
+[pod/lab10-gcsfuse-ai-storage-workers-0-0-w9xdb/pytorch] [CKPT_READ_VERIFY] reader_rank=0 reader_node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf target_rank=0 writer_node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf shard_sha256=376a3ea2c1fc485ab30c3f8e5db5c453c8f8c64ebb11286ece8fdf8e52f50937 status=VALID
+[pod/lab10-gcsfuse-ai-storage-workers-0-0-w9xdb/pytorch] [CKPT_READ_VERIFY] reader_rank=0 reader_node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf target_rank=1 writer_node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf shard_sha256=b59808c851b91a1d095d9701fccfe0220de42031f25e74b632ae71deb03f6997 status=VALID
+[pod/lab10-gcsfuse-ai-storage-workers-0-0-w9xdb/pytorch] [CKPT_READ_VERIFY] reader_rank=0 reader_node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf target_rank=2 writer_node=gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc shard_sha256=af4546870c7bd41c1b5e80487f28e9b530efac6bbe3cc038ef46307186f61de1 status=VALID
+[pod/lab10-gcsfuse-ai-storage-workers-0-0-w9xdb/pytorch] [LAB10_SUMMARY_JSON] {"cross_rank_checkpoint_validations": 9, "hns_rename": {"error": "", "ok": true, "published_exists_after_rename": true, "rename_ms": 136.04, "serialized_bytes": 134220352, "staging_exists_after_rename": false, "tensor_payload_bytes": 134217728, "write_ms": 1393.19}, "model_sha256": "b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9", "model_tensor_payload_bytes": 134217728, "mount_path": "/mnt/gcsfuse", "ranks": [{"cold_ms": 1190.6, "node_name": "gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf", "numeric_signature": 8474.860089, "pod_name": "lab10-gcsfuse-ai-storage-workers-0-0-w9xdb", "rank": 0, "sha256": "b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9", "speedup": 4.72, "tensor_payload_bytes": 134217728, "warm_ms": 252.48}, {"cold_ms": 1228.3, "node_name": "gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf", "numeric_signature": 8474.860089, "pod_name": "lab10-gcsfuse-ai-storage-workers-0-1-bjfff", "rank": 1, "sha256": "b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9", "speedup": 4.65, "tensor_payload_bytes": 134217728, "warm_ms": 264.05}, {"cold_ms": 1161.93, "node_name": "gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc", "numeric_signature": 8474.860089, "pod_name": "lab10-gcsfuse-ai-storage-workers-0-2-spml2", "rank": 2, "sha256": "b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9", "speedup": 4.8, "tensor_payload_bytes": 134217728, "warm_ms": 242.16}], "run_id": "run_20261019_202022_3334db8a", "unique_nodes": ["gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf", "gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc"], "world_size": 3}
+[pod/lab10-gcsfuse-ai-storage-workers-0-0-w9xdb/pytorch] [LAB10_SUCCESS] rank=0 pod=lab10-gcsfuse-ai-storage-workers-0-0-w9xdb node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf run_id=run_20261019_202022_3334db8a model_sha256=b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9 cross_rank_shards_verified=3/3 cluster_nodes=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf,gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc
+[pod/lab10-gcsfuse-ai-storage-workers-0-0-w9xdb/pytorch] Lab 10 GCS FUSE + HNS + File Cache + Distributed Checkpoint Benchmark Completed Successfully!
+[pod/lab10-gcsfuse-ai-storage-workers-0-1-bjfff/pytorch] [INIT] rank=1/3 pod=lab10-gcsfuse-ai-storage-workers-0-1-bjfff node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf run_id=run_20261019_202022_3334db8a mount_path=/mnt/gcsfuse
+[pod/lab10-gcsfuse-ai-storage-workers-0-1-bjfff/pytorch] [CACHE_BENCH] rank=1 pod=lab10-gcsfuse-ai-storage-workers-0-1-bjfff node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf cold_ms=1228.30 warm_ms=264.05 speedup=4.65x tensor_payload_bytes=134217728 numeric_sig=8474.860089 sha256=b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9
+[pod/lab10-gcsfuse-ai-storage-workers-0-1-bjfff/pytorch] [MODEL_VERIFY] rank=1 all_ranks_sha256_match=True sha256=b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9 tensor_payload_bytes=134217728 verified_ranks=3
+[pod/lab10-gcsfuse-ai-storage-workers-0-1-bjfff/pytorch] [CKPT_WRITE] rank=1 pod=lab10-gcsfuse-ai-storage-workers-0-1-bjfff node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf path=/mnt/gcsfuse/runs/run_20261019_202022_3334db8a/checkpoints/step_1/rank_1.pt bytes=263772 write_ms=174.92 shard_sha256=b59808c851b91a1d095d9701fccfe0220de42031f25e74b632ae71deb03f6997
+[pod/lab10-gcsfuse-ai-storage-workers-0-1-bjfff/pytorch] [CKPT_READ_VERIFY] reader_rank=1 reader_node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf target_rank=0 writer_node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf shard_sha256=376a3ea2c1fc485ab30c3f8e5db5c453c8f8c64ebb11286ece8fdf8e52f50937 status=VALID
+[pod/lab10-gcsfuse-ai-storage-workers-0-1-bjfff/pytorch] [CKPT_READ_VERIFY] reader_rank=1 reader_node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf target_rank=1 writer_node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf shard_sha256=b59808c851b91a1d095d9701fccfe0220de42031f25e74b632ae71deb03f6997 status=VALID
+[pod/lab10-gcsfuse-ai-storage-workers-0-1-bjfff/pytorch] [CKPT_READ_VERIFY] reader_rank=1 reader_node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf target_rank=2 writer_node=gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc shard_sha256=af4546870c7bd41c1b5e80487f28e9b530efac6bbe3cc038ef46307186f61de1 status=VALID
+[pod/lab10-gcsfuse-ai-storage-workers-0-1-bjfff/pytorch] [LAB10_SUCCESS] rank=1 pod=lab10-gcsfuse-ai-storage-workers-0-1-bjfff node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf run_id=run_20261019_202022_3334db8a model_sha256=b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9 cross_rank_shards_verified=3/3 cluster_nodes=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf,gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc
+[pod/lab10-gcsfuse-ai-storage-workers-0-2-spml2/pytorch] [INIT] rank=2/3 pod=lab10-gcsfuse-ai-storage-workers-0-2-spml2 node=gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc run_id=run_20261019_202022_3334db8a mount_path=/mnt/gcsfuse
+[pod/lab10-gcsfuse-ai-storage-workers-0-2-spml2/pytorch] [CACHE_BENCH] rank=2 pod=lab10-gcsfuse-ai-storage-workers-0-2-spml2 node=gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc cold_ms=1161.93 warm_ms=242.16 speedup=4.80x tensor_payload_bytes=134217728 numeric_sig=8474.860089 sha256=b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9
+[pod/lab10-gcsfuse-ai-storage-workers-0-2-spml2/pytorch] [MODEL_VERIFY] rank=2 all_ranks_sha256_match=True sha256=b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9 tensor_payload_bytes=134217728 verified_ranks=3
+[pod/lab10-gcsfuse-ai-storage-workers-0-2-spml2/pytorch] [CKPT_WRITE] rank=2 pod=lab10-gcsfuse-ai-storage-workers-0-2-spml2 node=gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc path=/mnt/gcsfuse/runs/run_20261019_202022_3334db8a/checkpoints/step_1/rank_2.pt bytes=263772 write_ms=167.94 shard_sha256=af4546870c7bd41c1b5e80487f28e9b530efac6bbe3cc038ef46307186f61de1
+[pod/lab10-gcsfuse-ai-storage-workers-0-2-spml2/pytorch] [CKPT_READ_VERIFY] reader_rank=2 reader_node=gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc target_rank=0 writer_node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf shard_sha256=376a3ea2c1fc485ab30c3f8e5db5c453c8f8c64ebb11286ece8fdf8e52f50937 status=VALID
+[pod/lab10-gcsfuse-ai-storage-workers-0-2-spml2/pytorch] [CKPT_READ_VERIFY] reader_rank=2 reader_node=gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc target_rank=1 writer_node=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf shard_sha256=b59808c851b91a1d095d9701fccfe0220de42031f25e74b632ae71deb03f6997 status=VALID
+[pod/lab10-gcsfuse-ai-storage-workers-0-2-spml2/pytorch] [CKPT_READ_VERIFY] reader_rank=2 reader_node=gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc target_rank=2 writer_node=gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc shard_sha256=af4546870c7bd41c1b5e80487f28e9b530efac6bbe3cc038ef46307186f61de1 status=VALID
+[pod/lab10-gcsfuse-ai-storage-workers-0-2-spml2/pytorch] [LAB10_SUCCESS] rank=2 pod=lab10-gcsfuse-ai-storage-workers-0-2-spml2 node=gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc run_id=run_20261019_202022_3334db8a model_sha256=b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9 cross_rank_shards_verified=3/3 cluster_nodes=gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf,gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc
+✅ Verified: HNS atomic rename, 128 MiB mmap checksum across 3 ranks, cold/warm benchmark, and 3x3 cross-rank checkpoint shards!
+```
+
+#### B. Verified `gke-gcsfuse-sidecar` Mount & HNS Auto-Optimization Logs
+```text
+{"severity":"INFO","message":"UserAgent = gcsfuse/3.11.2-gke.0 (Go version go1.26.5) (GPN:gcsfuse-gke-gcs-fuse-csi) (Cfg:1:1:1:1:0:0)"}
+{"severity":"INFO","message":"File Cache: Regular cache size: 512 MB (536870912 bytes)"}
+{"severity":"INFO","message":"MRD cache (LRU-based) enabled with maxSize=1000 (pools closed-file MRDs)"}
+{"severity":"INFO","message":"Calling GetStorageLayout for \"projects/_/buckets/enes-turan-demo-kueue-ai-storage/storageLayout\": Attempt: 1, with deadline=30s"}
+{"severity":"INFO","message":"GetStorageLayout -> (enes-turan-demo-kueue-ai-storage) 363 msec"}
+{"severity":"INFO","message":"GCSFuse Config","Applied optimizations for bucket-type: ":"hierarchical","Full Config":{"file-system.congestion-threshold":{"final_value":9,"optimization_reason":"bucket-type \"hierarchical\""},"file-system.fuse-max-request-size-kb":{"final_value":16384,"optimization_reason":"bucket-type \"hierarchical\""},"file-system.max-background":{"final_value":12,"optimization_reason":"bucket-type \"hierarchical\""},"file-system.max-read-ahead-kb":{"final_value":131072,"optimization_reason":"bucket-type \"hierarchical\""}}}
+{"severity":"INFO","message":"Mounting file system \"enes-turan-demo-kueue-ai-storage\"..."}
+{"severity":"INFO","message":"File system has been successfully mounted."}
+```
+
+#### C. Verified GCS HNS Bucket Objects (`gs://enes-turan-demo-kueue-ai-storage`)
+```text
+runs/run_20261019_202022_3334db8a/published_v1/model.pt        134220352 bytes
+runs/run_20261019_202022_3334db8a/checkpoints/step_1/rank_0.pt    263772 bytes
+runs/run_20261019_202022_3334db8a/checkpoints/step_1/rank_1.pt    263772 bytes
+runs/run_20261019_202022_3334db8a/checkpoints/step_1/rank_2.pt    263772 bytes
+```
+
+

@@ -1,6 +1,7 @@
 # 01 — Concepts & Architecture: Cloud-Native AI/ML Batch & Inference Scheduling on GKE
 
-This guide covers the theoretical and architectural foundations of distributed AI/ML batch training and multi-pod inference scheduling on Kubernetes using **Kueue (`v1beta2`)**, **JobSet (`v1alpha2`)**, **LeaderWorkerSet (`v1`)**, **Topology Aware Scheduling (TAS)**, **Multi-Team Cohorts**, **GKE Atomic `ProvisioningRequest`**, **Stateful Checkpointing**, **CEL Admission Governance**, and **Kueue Observability**.
+This guide covers the theoretical and architectural foundations of distributed AI/ML batch training, multi-pod inference scheduling, and cloud-native AI storage on Kubernetes using **Kueue (`v1beta2`)**, **JobSet (`v1alpha2`)**, **LeaderWorkerSet (`v1`)**, **Topology Aware Scheduling (TAS)**, **Multi-Team Cohorts**, **GKE Atomic `ProvisioningRequest`**, **Stateful Checkpointing**, **CEL Admission Governance**, **Kueue Observability**, and **GKE Cloud Storage FUSE CSI with Hierarchical Namespace (HNS)**.
+
 
 ---
 
@@ -157,3 +158,54 @@ Preemption (**Lab 4** & **Lab 5**) and Spot reclamation are only acceptable in p
 ### Queue Visibility API & Prometheus Metrics (**Lab 9**)
 - **On-Demand Visibility API (`visibility.kueue.x-k8s.io/v1beta2`):** Exposes `/apis/visibility.kueue.x-k8s.io/v1beta2/namespaces/<ns>/localqueues/<lq>/pendingworkloads` and `/clusterqueues/<cq>/pendingworkloads` so tenants and platform dashboards can inspect exact queue positions (`positionInClusterQueue`, `positionInLocalQueue`) in real time.
 - **Prometheus Metrics (`:8443/metrics`):** With `enableClusterQueueResources: true` enabled in `kueue-manager-config`, Kueue exports `kueue_pending_workloads`, `kueue_admitted_workloads_total`, `kueue_evicted_workloads_total`, `kueue_cluster_queue_nominal_quota`, and `kueue_cluster_queue_resource_usage`.
+
+---
+
+## 7. Cloud-Native AI Storage: GCS FUSE CSI, Hierarchical Namespace (HNS), Per-Pod File Cache & Distributed Checkpointing (**Lab 10**)
+
+In **Lab 7**, stateful checkpoints were written to node-local `hostPath` storage (`/var/tmp/kueue-checkpoints`), which only works if re-admitted Pods land on the exact same physical nodes and cannot share a single model publication or multi-rank sharded checkpoint directory across nodes without synchronizing over the network. Production distributed training and multi-node LLM serving on GKE require **shared, high-throughput, POSIX-like cloud storage** accessible simultaneously from every rank across racks and zones.
+
+```mermaid
+flowchart LR
+    subgraph TERRAFORM["Layer 1: Terraform (hashicorp/google)"]
+        WIF["GKE Workload Identity Pool\nPROJECT_ID.svc.id.goog\n+ Node GKE_METADATA"]
+        ADDON["GKE Add-On\ngcs_fuse_csi_driver_config\n(enabled = true)"]
+        BUCKET["GCS Bucket (HNS Enabled)\nuniform_bucket_level_access = true\nhierarchical_namespace = true"]
+        IAM["Direct Bucket IAM Member\nroles/storage.objectUser ->\nprincipal://.../ns/team-a/sa/lab10-gcsfuse-sa"]
+    end
+
+    subgraph K8S["Layer 2: Kueue + JobSet + GKE Webhook"]
+        KUEUE["Kueue Workload Admission\n3 x 1250m = 3750m CPU\n(3000m nom + 750m borrowed)"]
+        WEBHOOK["GKE GCS FUSE Mutating Webhook\nInjects gke-gcsfuse-sidecar (250m, 512Mi)\n+ gke-gcsfuse-metadata-prefetch (10m, 10Mi)"]
+        PODS["3 Worker Pods (2+1 across rack-1 & rack-2)\nEffective: 3 x 1510m = 4530m CPU\nMounted at /mnt/gcsfuse"]
+    end
+
+    TERRAFORM --> K8S
+    PODS <-->|"1. Rank 0 Atomic HNS Dir Rename\n2. 128 MiB mmap=True Cold/Warm Read\n3. 3x3 Cross-Rank Checkpoint Shards"| BUCKET
+```
+
+### Division of Responsibilities Across Layers
+
+| Component | Architectural Responsibility in Lab 10 |
+| :--- | :--- |
+| **Terraform (`terraform/`)** | Enables `storage.googleapis.com`, configures cluster `workload_identity_config` and `gcs_fuse_csi_driver_config`, sets `GKE_METADATA` on node pools, provisions the HNS-enabled GCS bucket (`force_destroy = false`), and binds `roles/storage.objectUser` directly to the Kubernetes `ServiceAccount` via its `principal://` federated identity. |
+| **Direct Workload Identity Federation** | Authenticates the `lab10-gcsfuse-sa` Kubernetes `ServiceAccount` directly to Google Cloud IAM (`principal://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/PROJECT_ID.svc.id.goog/subject/ns/team-a/sa/lab10-gcsfuse-sa`) with **zero GCP project-specific annotations** in Kubernetes YAML and zero service-account keys. |
+| **Cloud Storage Hierarchical Namespace (HNS)** | Provides a true logical directory tree in Cloud Storage (`storage.folders.*`), enabling **atomic $O(1)$ directory renames** (`os.rename(staging_dir, published_dir)`) so Rank 0 can stage a multi-hundred-megabyte model checkpoint and publish it atomically without partial-read race conditions or expensive $O(N)$ object copy+delete loops. |
+| **GKE Cloud Storage FUSE CSI Driver (`gcsfuse.csi.storage.gke.io`)** | Injects native `initContainers` (`restartPolicy: Always`)—`gke-gcsfuse-sidecar` (`250m` CPU, `512Mi` memory) and `gke-gcsfuse-metadata-prefetch` (`10m` CPU, `10Mi` memory)—into each worker Pod and mounts the bucket at `/mnt/gcsfuse` with local file caching (`fileCacheCapacity: "512Mi"`) and parallel downloads enabled. |
+| **Kueue vs. `kube-scheduler` Accounting** | Kueue evaluates the `JobSet` Pod template **before** Pod creation (`3 × 1250m = 3750m` CPU), whereas GKE's mutating webhook injects the FUSE sidecars **when Pods are created** (`3 × 1510m = 4530m` CPU, a **`+780m` CPU / `+1566Mi` memory sidecar tax**). Capacity engineering must account for both Kueue's cohort quota (`3750m` = `3000m` nominal + `750m` borrowed) and physical node allocatable capacity (`2 × 1510m = 3020m` on `rack-1` and `1 × 1510m = 1510m` on `rack-2`). |
+| **Distributed PyTorch Worker (`gcsfuse_bench.py`)** | Coordinates via `gloo` barriers: Rank 0 writes a deterministic `128 MiB` (`134,217,728` tensor payload bytes) model to `staging_v1/model.pt` and atomically renames `staging_v1` $\rightarrow$ `published_v1`; all 3 ranks open `published_v1/model.pt` with `torch.load(..., mmap=True, weights_only=True)`, touch every memory-mapped page to compute a cryptographic `SHA-256` digest across cold and repeated (warm) passes, write rank-specific checkpoint shards (`rank_0.pt`, `rank_1.pt`, `rank_2.pt`), and verify all $3 \times 3 = 9$ cross-rank shard reads across nodes. |
+
+### Verified Live GKE Benchmark Summary (`gke-kueue-workshop`, `v1.36.4-gke.1391002`, `gcsfuse/3.11.2-gke.0`)
+
+| Metric | Run 1 (`run_20261019_200043_ad58cb19`) | Run 2 (`run_20261019_202022_3334db8a`) | Key Takeaway |
+| :--- | :--- | :--- | :--- |
+| **Kueue Admitted Workload Quota** | `3750m` CPU / `4608Mi` Mem | `3750m` CPU / `4608Mi` Mem | `3000m` nominal (`team-a-cq`) + `750m` borrowed (`team-b-cq`) |
+| **Post-Webhook Effective Pod Requests** | `4530m` CPU / `6174Mi` Mem | `4530m` CPU / `6174Mi` Mem | `+780m` CPU / `+1566Mi` Mem injected by `gke-gcsfuse-sidecar` & `metadata-prefetch` |
+| **Rank 0 `128 MiB` Model Write (`staging_v1/model.pt`)** | `1828.48 ms` (`134,220,352` B) | `1393.19 ms` (`134,220,352` B) | Full `8 × (2048 × 2048)` `float32` tensor dict (`134,217,728` payload B) flushed to GCS |
+| **Rank 0 HNS Atomic Directory Rename (`staging_v1` $\rightarrow$ `published_v1`)** | **`142.43 ms`** | **`136.04 ms`** | $O(1)$ server-side `MoveFolder` metadata operation via `gcsfuse` HNS mode |
+| **Rank 0 (`rack-1`) Pass 1 Cold $\rightarrow$ Pass 2 Warm (`mmap=True`)** | `1512.97 ms` $\rightarrow$ `292.08 ms` (**`5.18x`**) | `1190.60 ms` $\rightarrow$ `252.48 ms` (**`4.72x`**) | Served from Pod-local `512Mi` `emptyDir` FUSE file cache on Pass 2 |
+| **Rank 1 (`rack-1`, co-located) Pass 1 Cold $\rightarrow$ Pass 2 Warm** | `1784.02 ms` $\rightarrow$ `248.48 ms` (**`7.18x`**) | `1228.30 ms` $\rightarrow$ `264.05 ms` (**`4.65x`**) | Co-located Rank 1 still performs a cold GCS fetch on Pass 1 because file caches are per-Pod |
+| **Rank 2 (`rack-2`, remote rack) Pass 1 Cold $\rightarrow$ Pass 2 Warm** | `1305.66 ms` $\rightarrow$ `234.80 ms` (**`5.56x`**) | `1161.93 ms` $\rightarrow$ `242.16 ms` (**`4.80x`**) | Identical `SHA-256` (`b95e5d8f...5bdbe9`) & `numeric_sig` (`8474.860089`) across all 3 ranks |
+| **Cross-Rank Checkpoint Shards (`checkpoints/epoch_001/rank_{0..2}.pt`)** | `9/9` `VALID` (`263,772` B/shard) | `9/9` `VALID` (`263,772` B/shard) | `100%` cross-rank `SHA-256` & `optimizer_step` verification across both rack nodes |
+
+

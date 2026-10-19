@@ -16,6 +16,16 @@ resource "google_container_cluster" "workshop" {
     channel = "REGULAR"
   }
 
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  addons_config {
+    gcs_fuse_csi_driver_config {
+      enabled = true
+    }
+  }
+
   ip_allocation_policy {
     cluster_secondary_range_name  = "pods-range"
     services_secondary_range_name = "services-range"
@@ -41,6 +51,10 @@ resource "google_container_node_pool" "system_pool" {
     service_account = google_service_account.gke_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
 
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
     labels = {
       "workload" = "system"
     }
@@ -62,6 +76,10 @@ resource "google_container_node_pool" "on_demand_tas" {
     disk_type       = "pd-balanced"
     service_account = google_service_account.gke_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
 
     labels = {
       "tier"                       = "on-demand"
@@ -94,6 +112,10 @@ resource "google_container_node_pool" "spot_atomic_pool" {
     service_account = google_service_account.gke_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
 
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
     labels = {
       "tier" = "spot"
     }
@@ -105,3 +127,4 @@ resource "google_container_node_pool" "spot_atomic_pool" {
     }
   }
 }
+

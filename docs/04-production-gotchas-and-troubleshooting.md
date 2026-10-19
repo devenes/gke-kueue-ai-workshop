@@ -1,6 +1,6 @@
 # 04 — Production Gotchas & Troubleshooting (Live GKE `v1.36` Field Notes)
 
-During live testing of Labs 1–9 on GKE Standard `v1.36.4-gke.1391002`, we encountered and resolved ten subtle, real-world production issues across Kubernetes Cluster Autoscaler, Kueue `v1beta2`, `JobSet`, `LeaderWorkerSet`, PyTorch DDP Checkpointing, CEL Admission Policies, and Prometheus Observability.
+During live testing of Labs 1–10 on GKE Standard `v1.36.4-gke.1391002`, we encountered and resolved thirteen subtle, real-world production issues across Kubernetes Cluster Autoscaler, Kueue `v1beta2`, `JobSet`, `LeaderWorkerSet`, PyTorch DDP Checkpointing, CEL Admission Policies, Prometheus Observability, and Cloud Storage FUSE CSI with Hierarchical Namespace (HNS).
 
 ---
 
@@ -62,8 +62,8 @@ Because `LeaderWorkerSet` defines a `leaderTemplate` and a `workerTemplate`, Kue
 
 **Fix ([`k8s/labs/lab6-lws-inference-tas.yaml`](../k8s/labs/lab6-lws-inference-tas.yaml)):** Pair `podset-required-topology` with `kueue.x-k8s.io/podset-group-name: "lws-rack-group"` on **both** `leaderTemplate` and `workerTemplate` so Kueue's TAS solver co-locates both PodSets onto the exact same physical rack domain.
 
-### Symptom B — LWS Controller Pending on `system-pool` & Slow Pod Termination
-1. The upstream `oci://registry.k8s.io/lws/charts/lws` (`0.11.1`) chart defaults to `resources.requests.cpu: 1` (`1000m`), which exceeds the remaining `614m` allocatable CPU on `system-pool` (`e2-standard-2`) when `jobset` (`500m`) and `kueue` (`500m`) are running. Passing `--set resources.requests.cpu=100m --set resources.requests.memory=128Mi` fits all 3 operators on `system-pool`.
+### Symptom B — LWS & Kueue Controller Rolling Updates on `system-pool` (`e2-standard-2`)
+1. The upstream `oci://registry.k8s.io/lws/charts/lws` (`0.11.1`) chart defaults to `resources.requests.cpu: 1` (`1000m`), which exceeds the remaining allocatable CPU on `system-pool` (`e2-standard-2`) when `jobset` (`500m`) and `kueue` (`500m`) are running. Furthermore, enabling GKE Workload Identity Federation (`gke-metadata-server`: `100m` CPU) and GCS FUSE CSI (`gcsfusecsi-node`: `15m` CPU) in **Lab 10** reduces free CPU on `system-pool` from `514m` to `391m`, which blocks a `RollingUpdate` surge of a `500m` `kueue-controller-manager` replica. Passing `--set resources.requests.cpu=100m` for `lws` and `--set controllerManager.manager.resources.requests.cpu=250m` for `kueue` leaves `641m` free CPU on `system-pool` so rolling restarts complete in seconds.
 2. Long-running LWS inference servers hold onto Kueue `Workload` quota for `30s` (`terminationGracePeriodSeconds`) on deletion unless `SIGTERM` is handled. Adding `signal.signal(signal.SIGTERM, lambda *_: os._exit(0))` in `infer_server.py` and `terminationGracePeriodSeconds: 2` releases quota in $<2\text{s}$.
 
 ---
@@ -100,8 +100,44 @@ In **Lab 9**:
 
 ---
 
+## Gotcha 11: Kueue Admission vs. GKE GCS FUSE Mutating Webhook Sidecar Resource Accounting
+
+### Symptom
+When submitting a `JobSet` with `gke-gcsfuse/volumes: "true"`, Kueue calculates `Workload` quota reservation from the `JobSet`'s Pod template **before** any Pods are created (`3 × 1250m = 3750m` CPU). Once Kueue unsuspends the `JobSet`, GKE's mutating webhook injects `gke-gcsfuse-sidecar` and `gke-gcsfuse-metadata-prefetch` as native sidecars (`initContainers` with `restartPolicy: Always`). If default webhook sidecar requests are used on 4-vCPU nodes, or if platform engineers size `ClusterQueue` quotas without accounting for the sidecar delta, Pods can get stuck `Pending (Insufficient cpu)` even after Kueue admits the `Workload`!
+
+### Root Cause & Fix ([`k8s/labs/lab10-gcsfuse-ai-storage.yaml`](../k8s/labs/lab10-gcsfuse-ai-storage.yaml))
+1. Always set explicit `gke-gcsfuse/*-request` and `gke-gcsfuse/*-limit` annotations on the Pod template (`gke-gcsfuse/cpu-request: "250m"`, `gke-gcsfuse/memory-request: "512Mi"`, `gke-gcsfuse/metadata-prefetch-cpu-request: "10m"`).
+2. Account for the `+260m` CPU / `+522Mi` memory per-Pod delta (`3750m` Kueue reservation vs. `4530m` actual `kube-scheduler` Pod requests across 3 Pods) so that `2` co-located Pods (`2 × 1510m = 3020m` CPU) fit comfortably within a 4-vCPU rack node's `~3170m–3372m` free allocatable CPU.
+
+---
+
+## Gotcha 12: Direct Workload Identity Federation for GCS HNS Buckets (`skipCSIBucketAccessCheck: "true"`)
+
+### Symptom
+1. Annotating a Kubernetes `ServiceAccount` with `iam.gke.io/gcp-service-account: ...@PROJECT_ID.iam.gserviceaccount.com` hardcodes a GCP project ID into Kubernetes manifests and requires managing an extra IAM Service Account + `roles/iam.workloadIdentityUser` binding.
+2. When binding least-privilege `roles/storage.objectUser` directly to the Kubernetes `ServiceAccount` principal (`principal://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/PROJECT_ID.svc.id.goog/subject/ns/team-a/sa/lab10-gcsfuse-sa`), the CSI node driver's pre-mount bucket metadata check fails unless `storage.buckets.get` is bypassed or granted.
+
+### Root Cause & Fix ([`terraform/network_iam.tf`](../terraform/network_iam.tf) & [`k8s/labs/lab10-gcsfuse-ai-storage.yaml`](../k8s/labs/lab10-gcsfuse-ai-storage.yaml))
+1. Bind `roles/storage.objectUser` directly to the WIF `principal://...` using `data.google_project.current.number` in Terraform (`roles/storage.objectUser` includes `storage.folders.create/delete/get/list/rename` required for HNS atomic directory renames and `GetStorageLayout`).
+2. Set `skipCSIBucketAccessCheck: "true"` in `csi.volumeAttributes` so `gcsfuse.csi.storage.gke.io` skips the redundant `storage.buckets.get` check while `gcsfuse` (`v3.11.2-gke.0`) automatically calls `GetStorageLayout` and enables `"Applied optimizations for bucket-type: hierarchical"`.
+
+---
+
+## Gotcha 13: Cross-Pod FUSE Metadata / Negative-Cache Consistency & OpenMP Thread Contention
+
+### Symptom
+1. **Cross-Pod Negative Cache:** If non-writer ranks (`Rank 1`, `Rank 2`) poll `os.path.exists("/mnt/gcsfuse/.../published_v1/model.pt")` before `Rank 0` finishes `os.rename(staging_dir, published_dir)`, `gcsfuse`'s metadata/stat cache caches a negative lookup (`ENOENT`) for `metadataCacheTTLSeconds` (`60s`), causing subsequent reads to fail with `FileNotFoundError`.
+2. **Co-Located OpenMP Thread Contention:** When two PyTorch Pods co-locate on the same 4-vCPU node (`on-demand-rack-1`), PyTorch's default OpenMP thread pool (`4` threads per Pod = `8` threads total) causes severe CPU context-switching during `mmap` tensor reduction.
+
+### Fix ([`k8s/base/pytorch-ddp-configmap.yaml`](../k8s/base/pytorch-ddp-configmap.yaml))
+1. Never poll target paths across FUSE mounts before the writer completes. Instead, `Rank 0` flushes, `os.fsync()`s, closes the file, executes `os.rename(staging_dir, published_dir)`, and then all ranks cross `dist.barrier()` before `Rank 1` and `Rank 2` open `published_v1/model.pt` for the first time. The same write $\rightarrow$ `fsync` $\rightarrow$ close $\rightarrow$ `dist.barrier()` pattern is enforced before cross-rank checkpoint verification.
+2. Call `torch.set_num_threads(1)` in `gcsfuse_bench.py` so co-located ranks on `rack-1` achieve deterministic `5.18x–7.18x` warm-cache read speedups without OpenMP thread thrashing.
+
+---
+
 ## Automated Diagnostics & Regression Verification (`make preflight` & `make test-all`)
 
 To eliminate manual troubleshooting before live workshops or after GKE upgrades, the [`scripts/`](../scripts/) directory provides two automated verification tools:
-- **`make preflight` ([`scripts/preflight-check.sh`](../scripts/preflight-check.sh)):** Runs 14 health checks in ~15 seconds, auditing node readiness, topology labels (`block-1/rack-1|2`), free allocatable CPU ($\ge 3000\text{m}$ per on-demand rack), operator deployments (`jobset-controller`, `lws-controller-manager`, `kueue-controller-manager`), webhook endpoints, `v1beta2` `ClusterQueue`/`LocalQueue` `Active=True` status, CEL `ValidatingAdmissionPolicy`, Visibility API `PendingWorkloadsSummary`, and Prometheus `:8443/metrics`.
-- **`make test-all` ([`scripts/smoke-test-all.sh`](../scripts/smoke-test-all.sh)):** Runs `make preflight` followed by an end-to-end automated execution and assertion suite across all 9 labs, cleaning up between each lab and printing a final 9/9 pass/fail summary table.
+- **`make preflight` ([`scripts/preflight-check.sh`](../scripts/preflight-check.sh)):** Runs 16 health checks in ~15 seconds, auditing node readiness, topology labels (`block-1/rack-1|2`), free allocatable CPU ($\ge 3000\text{m}$ per on-demand rack), operator deployments (`jobset-controller`, `lws-controller-manager`, `kueue-controller-manager`), webhook endpoints, `v1beta2` `ClusterQueue`/`LocalQueue` `Active=True` status, CEL `ValidatingAdmissionPolicy`, ConfigMaps & direct-WIF `ServiceAccount/lab10-gcsfuse-sa`, Visibility API `PendingWorkloadsSummary`, Prometheus `:8443/metrics`, `CSIDriver/gcsfuse.csi.storage.gke.io` + `gcsfusecsi-node` DaemonSet, and the Terraform HNS GCS bucket (`HNS=True, UBLA=True`).
+- **`make test-all` ([`scripts/smoke-test-all.sh`](../scripts/smoke-test-all.sh)):** Runs `make preflight` followed by an end-to-end automated execution and assertion suite across all 10 labs, cleaning up between each lab and printing a final 10/10 pass/fail summary table.
+

@@ -9,7 +9,7 @@ KUEUE_VERSION  ?= 0.16.2
 
 .DEFAULT_GOAL := help
 
-.PHONY: help lint infra-init infra-plan infra-up infra-down kubeconfig operators-install base-apply status preflight test-all lab1 lab2 lab3 lab4 lab5 lab6 lab7 lab8 lab9 labs-clean
+.PHONY: help lint infra-init infra-plan infra-up infra-down kubeconfig operators-install base-apply status preflight test-all lab1 lab2 lab3 lab4 lab5 lab6 lab7 lab8 lab9 lab10 labs-clean
 
 help: ## Show available workshop Make targets
 	@echo "================================================================================"
@@ -48,7 +48,7 @@ infra-plan: ## Validate and plan GCP & GKE Terraform infrastructure
 	terraform -chdir=terraform validate
 	terraform -chdir=terraform plan
 
-infra-up: ## Provision GCP VPC, IAM, GKE Cluster, and 4 Node Pools via Terraform
+infra-up: ## Provision GCP VPC, IAM, GKE Cluster, 4 Node Pools, and HNS GCS Bucket via Terraform
 	terraform -chdir=terraform apply -auto-approve
 
 infra-down: ## Destroy all GCP & GKE infrastructure via Terraform
@@ -80,14 +80,16 @@ operators-install: ## Install JobSet, LWS, and Kueue operators via official Helm
 			--namespace kueue-system \
 			--create-namespace \
 			--set controllerManager.nodeSelector.workload=system \
+			--set controllerManager.manager.resources.requests.cpu=250m \
 			--wait
 	@kubectl get configmap kueue-manager-config -n kueue-system -o json | \
 		python3 -c 'import sys, json; cm=json.load(sys.stdin); cfg=cm["data"]["controller_manager_config.yaml"]; cm["data"]["controller_manager_config.yaml"]=cfg.replace("bindAddress: :8443", "bindAddress: :8443\n  enableClusterQueueResources: true") if "enableClusterQueueResources" not in cfg else cfg; json.dump(cm, sys.stdout)' | \
 		kubectl apply -f -
+	kubectl set resources deployment/kueue-controller-manager -n kueue-system -c manager --requests=cpu=250m,memory=512Mi
 	kubectl rollout restart deployment/kueue-controller-manager -n kueue-system
 	kubectl rollout status deployment/kueue-controller-manager -n kueue-system --timeout=90s
 
-base-apply: ## Apply Namespaces, PyTorch DDP/LWS ConfigMaps, and Kueue v1beta2 setup via Kustomize
+base-apply: ## Apply Namespaces, ServiceAccounts, PyTorch ConfigMaps, and Kueue v1beta2 setup via Kustomize
 	kubectl apply -k k8s/base
 
 status: ## Inspect GKE nodes (with topology labels), Queues, Workloads, ProvisioningRequests, and Pods
@@ -179,14 +181,104 @@ lab9: ## Run Lab 9: Kueue On-Demand Visibility API (Pending Queue Order) & Prome
 		grep -E '^kueue_(pending_workloads|admitted_workloads_total|cluster_queue_resource_usage|cluster_queue_nominal_quota|evicted_workloads_total)\{.*team-a-cq.*replica_role="leader"'; \
 	kill $$PF_PID 2>/dev/null || true
 
+lab10: ## Run Lab 10: GCS FUSE CSI, Hierarchical Namespace (HNS), File Cache & Distributed Checkpointing
+	@set -euo pipefail; \
+	for cmd in terraform gcloud kubectl python3; do \
+		command -v "$$cmd" >/dev/null 2>&1 || { echo "ERROR: Required CLI '$$cmd' not found in PATH." >&2; exit 1; }; \
+	done; \
+	echo "=== Step 10A: Resolving HNS Bucket Name from Terraform Output ==="; \
+	BUCKET_NAME=$$(terraform -chdir=terraform output -raw gcs_ai_bucket_name 2>/dev/null || true); \
+	if [[ -z "$$BUCKET_NAME" || "$$BUCKET_NAME" == *"Warning"* ]]; then \
+		echo "ERROR: Could not resolve 'gcs_ai_bucket_name' from Terraform state in terraform/." >&2; \
+		echo "Run 'make infra-init && make infra-up' first so Terraform provisions the HNS bucket." >&2; \
+		exit 1; \
+	fi; \
+	ACTIVE_PROJECT=$$(gcloud config get-value project 2>/dev/null || true); \
+	if [[ "$$ACTIVE_PROJECT" != "$(PROJECT_ID)" ]]; then \
+		echo "ERROR: Active gcloud project ('$$ACTIVE_PROJECT') does not match PROJECT_ID ('$(PROJECT_ID)')." >&2; \
+		exit 1; \
+	fi; \
+	echo "Resolved Terraform HNS Bucket: gs://$$BUCKET_NAME (Project: $$ACTIVE_PROJECT)"; \
+	kubectl delete jobset lab10-gcsfuse-ai-storage -n team-a --ignore-not-found --wait=true >/dev/null 2>&1 || true; \
+	TMP_MANIFEST=$$(mktemp /tmp/lab10-gcsfuse-ai-storage.XXXXXX.yaml); \
+	trap 'rm -f "$$TMP_MANIFEST"' EXIT; \
+	sed "s|__GCS_AI_BUCKET_NAME__|$$BUCKET_NAME|g" k8s/labs/lab10-gcsfuse-ai-storage.yaml > "$$TMP_MANIFEST"; \
+	if grep -q "__GCS_AI_BUCKET_NAME__" "$$TMP_MANIFEST"; then \
+		echo "ERROR: Placeholder substitution failed in $$TMP_MANIFEST" >&2; exit 1; \
+	fi; \
+	kubectl apply --dry-run=client -f "$$TMP_MANIFEST" >/dev/null; \
+	echo "=== Step 10B: Applying Rendered Lab 10 Manifest (ServiceAccount + 3-Rank JobSet) ==="; \
+	kubectl apply -f "$$TMP_MANIFEST"; \
+	echo "=== Step 10C: Waiting for Kueue Workload Admission & Pod Creation ==="; \
+	WL_NAME=""; \
+	for _ in $$(seq 1 30); do \
+		WL_NAME=$$(kubectl get workloads -n team-a -o jsonpath='{.items[?(@.metadata.ownerReferences[0].name=="lab10-gcsfuse-ai-storage")].metadata.name}' 2>/dev/null || true); \
+		if [[ -n "$$WL_NAME" ]]; then break; fi; \
+		sleep 1; \
+	done; \
+	if [[ -z "$$WL_NAME" ]]; then echo "ERROR: Kueue Workload for lab10-gcsfuse-ai-storage not created." >&2; exit 1; fi; \
+	kubectl wait --for=condition=Admitted "workload/$$WL_NAME" -n team-a --timeout=90s; \
+	for _ in $$(seq 1 60); do \
+		POD_CNT=$$(kubectl get pods -n team-a -l jobset.sigs.k8s.io/jobset-name=lab10-gcsfuse-ai-storage --no-headers 2>/dev/null | wc -l | tr -d ' '); \
+		SCHED_CNT=$$(kubectl get pods -n team-a -l jobset.sigs.k8s.io/jobset-name=lab10-gcsfuse-ai-storage -o jsonpath='{.items[*].spec.nodeName}' 2>/dev/null | wc -w | tr -d ' '); \
+		if [[ "$$POD_CNT" == "3" && "$$SCHED_CNT" == "3" ]]; then break; fi; \
+		sleep 2; \
+	done; \
+	echo "=== Step 10D: Kueue Declared Quota vs. Post-Webhook GKE Sidecar Resource Audit ==="; \
+	python3 -c 'import json, subprocess, sys; \
+		wl_name = sys.argv[1]; \
+		kget = lambda *a: json.loads(subprocess.check_output(["kubectl", "get", *a, "-o", "json"])); \
+		p_cpu = lambda v: int(str(v or "0")[:-1]) if str(v or "0").endswith("m") else (int(str(v)[:-1]) // 1000000 if str(v or "0").endswith("n") else int(float(v or 0) * 1000)); \
+		p_mem = lambda v: int(str(v or "0")[:-2]) // 1024 if str(v or "0").endswith("Ki") else (int(str(v)[:-2]) if str(v or "0").endswith("Mi") else (int(str(v)[:-2]) * 1024 if str(v or "0").endswith("Gi") else int(v or 0) // (1024 * 1024))); \
+		wl = kget("workload", wl_name, "-n", "team-a"); \
+		cq = kget("clusterqueue", "team-a-cq"); \
+		cq_res = json.dumps(cq.get("status", {}).get("flavorsReservation", [])); \
+		pods = sorted(kget("pods", "-n", "team-a", "-l", "jobset.sigs.k8s.io/jobset-name=lab10-gcsfuse-ai-storage")["items"], key=lambda x: x["metadata"]["name"]); \
+		ps = wl["spec"]["podSets"][0]; \
+		ps_cnt = ps["count"]; \
+		creq = ps["template"]["spec"]["containers"][0]["resources"]["requests"]; \
+		k_cpu, k_mem = p_cpu(creq["cpu"]), p_mem(creq["memory"]); \
+		kt_cpu, kt_mem = ps_cnt * k_cpu, ps_cnt * k_mem; \
+		print(f"Kueue Workload ({wl_name}): {ps_cnt} pods x ({k_cpu}m CPU, {k_mem}Mi Mem) = {kt_cpu}m CPU, {kt_mem}Mi Mem"); \
+		print(f"ClusterQueue team-a-cq Reservation: {cq_res}"); \
+		get_ctrs = lambda p: [(c["name"] + "[init-sidecar]", c.get("resources", {}).get("requests", {})) for c in p["spec"].get("initContainers", []) if c.get("restartPolicy") == "Always"] + [(c["name"], c.get("resources", {}).get("requests", {})) for c in p["spec"].get("containers", [])]; \
+		pod_stats = [(p["metadata"]["name"], p["spec"].get("nodeName", "unscheduled"), [(n, p_cpu(r.get("cpu", "0m")), p_mem(r.get("memory", "0Mi"))) for n, r in get_ctrs(p)]) for p in pods]; \
+		[print(f"  Pod {pn} on {nd}: effective={sum(c[1] for c in cs)}m CPU, {sum(c[2] for c in cs)}Mi Mem -> " + ", ".join(f"{c[0]}({c[1]}m,{c[2]}Mi)" for c in cs)) for pn, nd, cs in pod_stats]; \
+		at_cpu = sum(sum(c[1] for c in cs) for _, _, cs in pod_stats); \
+		at_mem = sum(sum(c[2] for c in cs) for _, _, cs in pod_stats); \
+		nc = {nd: sum(1 for _, n2, _ in pod_stats if n2 == nd) for _, nd, _ in pod_stats}; \
+		print(f"Post-Webhook Total Across {len(pods)} Pods: {at_cpu}m CPU, {at_mem}Mi Mem (Delta: +{at_cpu - kt_cpu}m CPU, +{at_mem - kt_mem}Mi Mem)"); \
+		print(f"Physical Node Placement Distribution: {nc}"); \
+		(print(f"ERROR: Expected 2+1 Pod distribution across 2 rack nodes, got {nc}", file=sys.stderr), sys.exit(1)) if (len(pods) != 3 or sorted(nc.values()) != [1, 2]) else None; \
+		(print(f"ERROR: Expected post-webhook Pod CPU ({at_cpu}m) > Kueue declared CPU ({kt_cpu}m)", file=sys.stderr), sys.exit(1)) if at_cpu <= kt_cpu else None' "$$WL_NAME"; \
+	echo "=== Step 10E: Waiting for 3-Rank Distributed Benchmark JobSet Completion ==="; \
+	kubectl wait --for=condition=Completed jobset/lab10-gcsfuse-ai-storage -n team-a --timeout=240s; \
+	echo "=== Step 10F: Distributed Benchmark Logs & Integrity Verification ==="; \
+	ALL_LOGS=$$(kubectl logs -n team-a -l jobset.sigs.k8s.io/jobset-name=lab10-gcsfuse-ai-storage -c pytorch --prefix=true --tail=-1); \
+	echo "$$ALL_LOGS"; \
+	python3 -c 'import sys; \
+		logs = sys.argv[1]; \
+		chk = lambda tag, sub="": [l for l in logs.splitlines() if tag in l and sub in l]; \
+		errs = [m for ok, m in [ \
+			(len(chk("[HNS_RENAME]", "published_exists=True")) >= 1, "Missing [HNS_RENAME] verification log"), \
+			(len(chk("[CACHE_BENCH]", "tensor_payload_bytes=134217728")) == 3, "Expected 3 [CACHE_BENCH] lines"), \
+			(len(chk("[MODEL_VERIFY]", "all_ranks_sha256_match=True")) == 3, "Expected 3 [MODEL_VERIFY] lines"), \
+			(len(chk("[CKPT_WRITE]")) == 3, "Expected 3 [CKPT_WRITE] lines"), \
+			(len(chk("[CKPT_READ_VERIFY]", "status=VALID")) == 9, "Expected 9 [CKPT_READ_VERIFY] lines (3x3)"), \
+			(len(chk("[LAB10_SUCCESS]")) == 3, "Expected 3 [LAB10_SUCCESS] lines") \
+		] if not ok]; \
+		(print("ERROR: " + "; ".join(errs), file=sys.stderr), sys.exit(1)) if errs else print("✅ Verified: HNS atomic rename, 128 MiB mmap checksum across 3 ranks, cold/warm benchmark, and 3x3 cross-rank checkpoint shards!")' "$$ALL_LOGS"
+
+
 labs-clean: ## Delete all lab JobSets and LeaderWorkerSets in namespaces team-a and team-b
 	kubectl delete jobsets,leaderworkersets --all -n team-a --ignore-not-found --wait=true
 	kubectl delete jobsets,leaderworkersets --all -n team-b --ignore-not-found --wait=true
 	kubectl wait --for=delete pod --all -n team-a --timeout=60s 2>/dev/null || true
 	kubectl wait --for=delete pod --all -n team-b --timeout=60s 2>/dev/null || true
 
-preflight: ## Run 15-second pre-flight health check across nodes, operators, queues, CEL policy, and metrics
+preflight: ## Run 15-second 16-point pre-flight health check across nodes, operators, queues, CEL policy, metrics & GCS FUSE HNS
 	./scripts/preflight-check.sh
 
-test-all: ## Run end-to-end automated smoke test suite across all 9 hands-on labs
+test-all: ## Run end-to-end automated smoke test suite across all 10 hands-on labs
 	./scripts/smoke-test-all.sh
+

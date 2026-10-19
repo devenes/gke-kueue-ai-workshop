@@ -13,7 +13,7 @@
 [![Terraform](https://img.shields.io/badge/Terraform-%3E%3D%201.6-844FBA?logo=terraform&logoColor=white)](https://www.terraform.io/)
 [![Cost](https://img.shields.io/badge/Cloud%20Cost-~%240.40%2Fhr%20(Zero%20GPU)-2EA44F)](#architecture-overview)
 
-[**Quickstart**](#quickstart) · [**Architecture**](#architecture-overview) · [**9 Hands-On Labs**](#9-hands-on-labs) · [**Documentation**](#documentation-index-docs) · [**Speaker Runbook**](docs/05-speaker-demo-cheatsheet.md)
+[**Quickstart**](#quickstart) · [**Architecture**](#architecture-overview) · [**10 Hands-On Labs**](#10-hands-on-labs) · [**Documentation**](#documentation-index-docs) · [**Speaker Runbook**](docs/05-speaker-demo-cheatsheet.md)
 
 </div>
 
@@ -21,12 +21,12 @@
 
 ## Why This Repository?
 
-Most distributed AI/ML scheduling tutorials require expensive H100/L4 GPU reservations or stop at trivial `sleep` pods. This repository provides a **100% reproducible, production-faithful AI/ML platform blueprint** that runs on standard CPU-only GKE nodes (`~$0.40/hr` total):
+Most distributed AI/ML scheduling tutorials require expensive H100/L4 GPU reservations or stop at trivial `sleep` pods. This repository provides a **100% reproducible, production-faithful AI/ML platform blueprint** that runs on standard CPU-only GKE nodes (`~$0.40/hr` compute + pennies for regional GCS object storage/operations):
 
-- **Zero GPU Quota Required:** Runs real multi-node **PyTorch `DistributedDataParallel (DDP)`** (`torchrun`) and **2-Shard Tensor-Parallel `AllReduce` HTTP Inference** over the `gloo` CPU backend—exhibiting the exact same gang-scheduling barriers, collective rendezvous, and `SIGTERM` checkpoint semantics as 1,000-GPU clusters.
-- **Zero Container Build Latency:** Uses the official 548 MB `pytorch/torchserve:0.12.0-cpu` (`PyTorch 2.4.0+cpu`) image with training and inference scripts injected dynamically via Kubernetes `ConfigMap`s.
-- **Strict Infra vs. K8s Separation:** Layer 1 (`terraform/`) uses **only** `hashicorp/google` (`~> 6.0`) with zero `kubernetes`/`helm` state coupling. Layer 2 (`k8s/` + `Makefile`) manages OCI Helm operators, Kustomize base policies, and 9 progressive lab manifests.
-- **Automated Verification & CI Suite:** Includes a 15-second **14-point Pre-Flight Check** ([`scripts/preflight-check.sh`](scripts/preflight-check.sh)), a **9-Lab E2E Smoke Test Suite** ([`scripts/smoke-test-all.sh`](scripts/smoke-test-all.sh)), and a zero-credential **GitHub Actions Static Analysis CI Pipeline** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+- **Zero GPU Quota Required:** Runs real multi-node **PyTorch `DistributedDataParallel (DDP)`** (`torchrun`), **2-Shard Tensor-Parallel `AllReduce` HTTP Inference**, and **3-Rank Distributed Model Caching & Checkpointing over Cloud Storage FUSE CSI** (`gloo` CPU backend)—exhibiting the exact same gang-scheduling barriers, collective rendezvous, HNS atomic directory renames, and `SIGTERM` checkpoint semantics as 1,000-GPU clusters.
+- **Zero Container Build Latency:** Uses the official 548 MB `pytorch/torchserve:0.12.0-cpu` (`PyTorch 2.4.0+cpu`) image with training, inference, and storage benchmark scripts injected dynamically via Kubernetes `ConfigMap`s.
+- **Strict Infra vs. K8s Separation:** Layer 1 (`terraform/`) uses **only** `hashicorp/google` (`~> 6.0`) with zero `kubernetes`/`helm` state coupling. Layer 2 (`k8s/` + `Makefile`) manages OCI Helm operators, Kustomize base policies, and 10 progressive lab manifests.
+- **Automated Verification & CI Suite:** Includes a 15-second **16-point Pre-Flight Check** ([`scripts/preflight-check.sh`](scripts/preflight-check.sh)), a **10-Lab E2E Smoke Test Suite** ([`scripts/smoke-test-all.sh`](scripts/smoke-test-all.sh)), and a zero-credential **GitHub Actions Static Analysis CI Pipeline** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ---
 
@@ -42,32 +42,33 @@ Most distributed AI/ML scheduling tutorials require expensive H100/L4 GPU reserv
 ```bash
 make lint              # Run local static analysis (Terraform fmt/validate, Kustomize, Python AST, ShellCheck)
 make infra-init        # Initialize Terraform providers
-make infra-up          # Provision VPC, GKE cluster, and 4 node pools (~9 mins)
+make infra-up          # Provision VPC, GKE cluster (WIF + GCS FUSE CSI), 4 node pools & HNS GCS bucket (~9 mins)
 make kubeconfig        # Configure local ~/.kube/config
 make operators-install # Install JobSet (v0.10.1), LWS (v0.11.1) & Kueue (v0.16.2) on system-pool
-make base-apply        # Apply Namespaces, PyTorch ConfigMaps, CEL Governance, and Kueue v1beta2 setup
-make preflight         # Run 15-second 14-point pre-flight health check across nodes, operators & queues
+make base-apply        # Apply Namespaces, ServiceAccounts, PyTorch ConfigMaps, CEL Governance & Kueue v1beta2 setup
+make preflight         # Run 15-second 16-point pre-flight health check across nodes, operators, queues & HNS bucket
 make status            # Inspect Nodes, Topology labels, Queues, and AdmissionChecks
 ```
 
 ### 2. Run Automated Smoke Suite or Individual Labs
 ```bash
-make test-all          # Run end-to-end automated regression suite across all 9 labs
-make lab1              # Or run any individual lab (lab1 through lab9)
-make labs-clean        # Clean up all JobSets and LeaderWorkerSets between labs
+make test-all          # Run end-to-end automated regression suite across all 10 labs
+make lab10             # Or run any individual lab (lab1 through lab10)
+make labs-clean        # Clean up transient Kubernetes JobSets and LeaderWorkerSets between labs (preserves infra & GCS bucket)
 ```
 
-### 3. Teardown
+### 3. Teardown (Separate from Default Lab Workflow)
+> **Note:** `make labs-clean` only removes transient Kubernetes `JobSet` and `LeaderWorkerSet` objects while keeping the GKE cluster and HNS GCS bucket intact. Only run `make infra-down` when permanently decommissioning the cloud environment.
 ```bash
 make labs-clean
-make infra-down        # Destroy GKE cluster, Node Pools, VPC, and IAM resources
+make infra-down        # Destroy GKE cluster, Node Pools, VPC, and IAM resources (separate teardown step)
 ```
 
 ---
 
-## 9 Hands-On Labs
+## 10 Hands-On Labs
 
-See **[`docs/03-labs-step-by-step-guide.md`](docs/03-labs-step-by-step-guide.md)** for architectural walkthroughs, Mermaid sequence diagrams, and verified outputs from GKE `v1.36.4-gke.1391002`:
+See **[`docs/03-labs-step-by-step-guide.md`](docs/03-labs-step-by-step-guide.md)** for architectural walkthroughs, Mermaid sequence diagrams, and verified outputs from GKE Standard `v1.36`:
 
 | Target | Lab Scenario | Manifest | Key Capability Demonstrated |
 | :--- | :--- | :--- | :--- |
@@ -80,6 +81,7 @@ See **[`docs/03-labs-step-by-step-guide.md`](docs/03-labs-step-by-step-guide.md)
 | **`make lab7`** | **7. Stateful Checkpointing & Resume** | [`lab7-checkpoint-resume.yaml`](k8s/labs/lab7-checkpoint-resume.yaml) | `resumable-research-job` saves atomic PyTorch DDP checkpoints after Epochs 1–4, traps `SIGTERM` via `exec torchrun` when preempted by `urgent-checkpoint-preemptor`, and automatically resumes from **Epoch 5/8** (`Zero Goodput Lost!`) upon re-admission. |
 | **`make lab8`** | **8. CEL Governance & Max-Exec-Time SLA** | [`lab8-governance-and-max-exec.yaml`](k8s/labs/lab8-governance-and-max-exec.yaml) | Blocks an unlabeled rogue `JobSet` at the API server via Kubernetes `ValidatingAdmissionPolicy` (`require-kueue-queue-name`), then auto-evicts and deactivates a runaway job after its 20-second SLA (`kueue.x-k8s.io/max-exec-time-seconds: "20"`). |
 | **`make lab9`** | **9. Visibility API & Prometheus Metrics** | [`lab9-visibility-and-metrics.yaml`](k8s/labs/lab9-visibility-and-metrics.yaml) | Queries Kueue's `v1beta2` `PendingWorkloadsSummary` API to prove a high-priority job jumps to `positionInClusterQueue: 0` ahead of an earlier low-priority job, and scrapes live `ClusterQueue` metrics from `:8443/metrics`. |
+| **`make lab10`** | **10. GCS FUSE CSI, HNS, File Cache & Checkpoints** | [`lab10-gcsfuse-ai-storage.yaml`](k8s/labs/lab10-gcsfuse-ai-storage.yaml) | Mounts a Terraform-provisioned **Hierarchical Namespace (HNS)** GCS bucket via `gcsfuse.csi.storage.gke.io` and direct Workload Identity Federation (`lab10-gcsfuse-sa`), stages & atomically renames a `128 MiB` model directory, verifies `mmap=True` SHA-256 integrity across 3 ranks (`2+1` rack placement), benchmarks cold vs. warm reads, validates $3 \times 3$ cross-rank checkpoint shards, and audits the Kueue (`3750m`) vs. post-webhook GKE sidecar (`4530m`) CPU accounting delta. |
 
 ---
 
@@ -88,17 +90,18 @@ See **[`docs/03-labs-step-by-step-guide.md`](docs/03-labs-step-by-step-guide.md)
 ### Strict Two-Layer Separation of Concerns
 1. **Layer 1 — Cloud Infrastructure ([`terraform/`](terraform/)):**
    - Managed **100% via Terraform** using **only** `hashicorp/google` (`~> 6.0`). Zero `kubernetes`, `helm`, or `kubectl` providers are mixed into the infrastructure state.
-   - Provisions a custom VPC, secondary Pod/Service CIDR subnets, a least-privilege Node Service Account, a Zonal GKE Standard Cluster (`europe-west1-b`), and **4 specialized Node Pools**.
+   - Provisions a custom VPC, secondary Pod/Service CIDR subnets, a least-privilege Node Service Account, a Zonal GKE Standard Cluster (`europe-west1-b`) with **Workload Identity Federation** (`${project_id}.svc.id.goog`) and the **Cloud Storage FUSE CSI Driver** (`gcs_fuse_csi_driver_config`) enabled, **4 specialized Node Pools** (`GKE_METADATA`), and a regional **Hierarchical Namespace (HNS)** GCS bucket (`${project_id}-kueue-ai-storage`) with direct `principal://` IAM (`roles/storage.objectUser`) bound to `team-a/lab10-gcsfuse-sa`.
    - **Declarative Topology Labels:** Because the GKE API restricts user-defined labels under `cloud.google.com/`, custom topology labels (`workshop.ai/topology-block` and `workshop.ai/topology-rack`) are declaratively injected at the Terraform node pool level.
 
 2. **Layer 2 — Kubernetes & Batch/Inference Orchestration ([`k8s/`](k8s/) & [`Makefile`](Makefile)):**
    - **Helm OCI Charts:** Installs upstream **JobSet** (`v0.10.1`), **LeaderWorkerSet** (`v0.11.1`), and **Kueue** (`v0.16.2`), pinned to `system-pool` (`workload=system`).
-   - **Kustomize ([`k8s/base/`](k8s/base/)):** Configures multi-team namespaces (`team-a`, `team-b` labeled `kueue-governance: "enforced"`), zero-build PyTorch `gloo` DDP training, stateful checkpointing, and LWS Tensor-Parallel inference scripts (`ConfigMap`), native Kubernetes CEL `ValidatingAdmissionPolicy` (`require-kueue-queue-name`), and Kueue `v1beta2` objects (`Topology`, `ResourceFlavor`, `ProvisioningRequestConfig`, `AdmissionCheck`, `WorkloadPriorityClass`, `ClusterQueue`s `team-a-cq` & `team-b-cq` in `ai-org-cohort`, and `LocalQueue`s).
+   - **Kustomize ([`k8s/base/`](k8s/base/)):** Configures multi-team namespaces (`team-a`, `team-b` labeled `kueue-governance: "enforced"`), dedicated `ServiceAccount` (`lab10-gcsfuse-sa`), zero-build PyTorch `gloo` DDP training, stateful checkpointing, LWS Tensor-Parallel inference, and GCS FUSE storage benchmark scripts (`ConfigMap`), native Kubernetes CEL `ValidatingAdmissionPolicy` (`require-kueue-queue-name`), and Kueue `v1beta2` objects (`Topology`, `ResourceFlavor`, `ProvisioningRequestConfig`, `AdmissionCheck`, `WorkloadPriorityClass`, `ClusterQueue`s `team-a-cq` & `team-b-cq` in `ai-org-cohort`, and `LocalQueue`s).
 
 ```mermaid
 flowchart TB
-    subgraph GCP["GCP Project: enes-turan-demo (europe-west1-b)"]
-        subgraph GKE["GKE Standard Cluster: gke-kueue-workshop"]
+    subgraph GCP["GCP Project: enes-turan-demo (europe-west1 / europe-west1-b)"]
+        GCS["GCS Bucket (HNS + Uniform Access)\nenes-turan-demo-kueue-ai-storage\nDirect WIF IAM: roles/storage.objectUser"]
+        subgraph GKE["GKE Standard Cluster: gke-kueue-workshop (WIF + GcsFuseCsiDriver)"]
             subgraph SYS["Node Pool: system-pool (1x e2-standard-2)"]
                 KUEUE["Kueue Operator (v0.16.2)\n+ Visibility API + Prometheus :8443"]
                 JOBSET["JobSet Operator (v0.10.1)"]
@@ -124,6 +127,7 @@ flowchart TB
     CQ -->|"2. Spills over to spot-flavor\nTriggers AdmissionCheck"| AC["AdmissionCheck: spot-atomic-check\nProvisioningRequestConfig"]
     AC -->|"Creates ProvisioningRequest"| CA
     CA -->|"Atomically provisions 3 Spot Nodes"| SPOT
+    BLOCK1 <-->|"3. Lab 10: gcsfuse.csi.storage.gke.io\nHNS Atomic Rename + File Cache + Shards"| GCS
 ```
 
 ### Cluster Node Pools & Quota Blueprint
@@ -131,8 +135,8 @@ flowchart TB
 | Node Pool | Machine Type | Scaling | Node Labels & Taints | Kueue Flavor / Role |
 | :--- | :--- | :--- | :--- | :--- |
 | **`system-pool`** | `e2-standard-2` (`2 vCPU`, `8 GB`) | Static `1` node | `workload=system` | Hosts `kueue`, `jobset`, and `lws` operators in isolation |
-| **`on-demand-rack-1`** | `e2-standard-4` (`4 vCPU`, `16 GB`) | Static `1` node | `tier=on-demand`, `workshop.ai/topology-block=block-1`, `workshop.ai/topology-rack=rack-1` | `on-demand-flavor` (`~3484m` free allocatable CPU) |
-| **`on-demand-rack-2`** | `e2-standard-4` (`4 vCPU`, `16 GB`) | Static `1` node | `tier=on-demand`, `workshop.ai/topology-block=block-1`, `workshop.ai/topology-rack=rack-2` | `on-demand-flavor` (`~3292m` free allocatable CPU) |
+| **`on-demand-rack-1`** | `e2-standard-4` (`4 vCPU`, `16 GB`) | Static `1` node | `tier=on-demand`, `workshop.ai/topology-block=block-1`, `workshop.ai/topology-rack=rack-1` | `on-demand-flavor` (`~3450m–3494m` free allocatable CPU) |
+| **`on-demand-rack-2`** | `e2-standard-4` (`4 vCPU`, `16 GB`) | Static `1` node | `tier=on-demand`, `workshop.ai/topology-block=block-1`, `workshop.ai/topology-rack=rack-2` | `on-demand-flavor` (`~3292m–3335m` free allocatable CPU) |
 | **`spot-atomic-pool`** | `e2-standard-4` (`4 vCPU`, `16 GB`, Spot) | Autoscaled `0 -> 3` | `tier=spot`, Taint: `spot-only=true:NoSchedule` | `spot-flavor` via `ProvisioningRequest` (`9 vCPU` quota) |
 
 ---
@@ -143,11 +147,11 @@ Start here for deep-dive architectural guides, capacity engineering math, live G
 
 | Guide | Description |
 | :--- | :--- |
-| **[01 — Concepts & Architecture](docs/01-concepts-and-architecture.md)** | Why default Kubernetes fails for distributed AI/ML; deep dive into Kueue `v1beta2`, Multi-Team Cohorts, `JobSet` `v1alpha2`, `LeaderWorkerSet` `v1`, PyTorch DDP/TP (`gloo`), Topology Aware Scheduling (TAS), GKE Atomic `ProvisioningRequest`, Stateful Checkpointing, CEL Governance, and Kueue Observability. |
-| **[02 — Infrastructure & Capacity Math](docs/02-infrastructure-and-capacity-math.md)** | Strict separation of Terraform (`hashicorp/google`) vs. K8s, custom `workshop.ai/topology-*` labels, `ai-org-cohort` borrowing/reclamation math, and real `e2-standard-4` allocatable CPU math (`3292m–3494m` free per node) across all 9 labs. |
-| **[03 — Step-by-Step Labs Guide (Labs 1–9)](docs/03-labs-step-by-step-guide.md)** | Manifest breakdowns, Mermaid sequence diagrams, verification commands, and real terminal outputs from GKE `v1.36.4-gke.1391002` across all 9 labs. |
-| **[04 — Production Gotchas & Troubleshooting](docs/04-production-gotchas-and-troubleshooting.md)** | Ten critical engineering lessons from live GKE testing (`best-effort-atomic-scale-up.autoscaling.x-k8s.io`, TAS spillover rules, `v1beta2` `cohortName`, `JobSet` webhook immutability, LWS Cross-PodSet TAS `podset-group-name`, `reclaimWithinCohort`, PID 1 `exec torchrun` `SIGTERM` checkpointing, CEL governance, and `enableClusterQueueResources` Prometheus scraping). |
-| **[05 — Speaker Demo Cheat Sheet](docs/05-speaker-demo-cheatsheet.md)** | Two-Terminal Split-Screen Runbook (`watch` observer + command driver) with speaker talking points for all 9 live demos. |
+| **[01 — Concepts & Architecture](docs/01-concepts-and-architecture.md)** | Why default Kubernetes fails for distributed AI/ML; deep dive into Kueue `v1beta2`, Multi-Team Cohorts, `JobSet` `v1alpha2`, `LeaderWorkerSet` `v1`, PyTorch DDP/TP (`gloo`), Topology Aware Scheduling (TAS), GKE Atomic `ProvisioningRequest`, Stateful Checkpointing, CEL Governance, Kueue Observability, and Cloud Storage FUSE CSI with HNS. |
+| **[02 — Infrastructure & Capacity Math](docs/02-infrastructure-and-capacity-math.md)** | Strict separation of Terraform (`hashicorp/google`) vs. K8s, custom `workshop.ai/topology-*` labels, `ai-org-cohort` borrowing/reclamation math, Kueue vs. GKE webhook sidecar resource accounting (`3750m` vs. `4530m`), and real `e2-standard-4` allocatable CPU math across all 10 labs. |
+| **[03 — Step-by-Step Labs Guide (Labs 1–10)](docs/03-labs-step-by-step-guide.md)** | Manifest breakdowns, Mermaid sequence diagrams, verification commands, and real terminal outputs from GKE Standard `v1.36` across all 10 labs. |
+| **[04 — Production Gotchas & Troubleshooting](docs/04-production-gotchas-and-troubleshooting.md)** | Thirteen critical engineering lessons from live GKE testing (`best-effort-atomic-scale-up.autoscaling.x-k8s.io`, TAS spillover rules, `v1beta2` `cohortName`, `JobSet` webhook immutability, LWS Cross-PodSet TAS `podset-group-name`, `reclaimWithinCohort`, PID 1 `exec torchrun` `SIGTERM` checkpointing, CEL governance, `enableClusterQueueResources` Prometheus scraping, GCS FUSE sidecar webhook tax, direct WIF IAM, and cross-Pod negative-cache prevention). |
+| **[05 — Speaker Demo Cheat Sheet](docs/05-speaker-demo-cheatsheet.md)** | Two-Terminal Split-Screen Runbook (`watch` observer + command driver) with speaker talking points for all 10 live demos. |
 
 ---
 
@@ -161,7 +165,7 @@ gke-kueue-ai-workshop/
 ├── .gitignore
 ├── .yamllint.yaml                                      # YAML lint rules for K8s manifests & GitHub Actions
 ├── LICENSE
-├── Makefile                                            # Self-documenting workflow orchestration (including `make lint`)
+├── Makefile                                            # Self-documenting workflow orchestration (including `make lint` & `make lab10`)
 ├── README.md                                           # Workshop overview, architecture & quickstart
 ├── docs/                                               # Zero-to-advanced documentation suite
 │   ├── 01-concepts-and-architecture.md
@@ -170,19 +174,19 @@ gke-kueue-ai-workshop/
 │   ├── 04-production-gotchas-and-troubleshooting.md
 │   └── 05-speaker-demo-cheatsheet.md
 ├── scripts/                                            # Automated pre-flight & E2E verification suite
-│   ├── preflight-check.sh                              # 15-second 14-point cluster readiness check
-│   └── smoke-test-all.sh                               # Automated 9-lab end-to-end regression suite
+│   ├── preflight-check.sh                              # 15-second 16-point cluster & HNS storage readiness check
+│   └── smoke-test-all.sh                               # Automated 10-lab end-to-end regression suite
 ├── terraform/                                          # LAYER 1: Pure GCP Cloud Infrastructure
 │   ├── versions.tf                                     # hashicorp/google (~> 6.0) only
 │   ├── variables.tf                                    # Project, Region, Zone, Cluster variables
-│   ├── network_iam.tf                                  # GCP APIs, Custom VPC, Subnet, Node SA
-│   ├── gke.tf                                          # Zonal GKE Cluster + 4 Node Pools
-│   └── outputs.tf                                      # Cluster info & gcloud kubeconfig command
+│   ├── network_iam.tf                                  # GCP APIs, Custom VPC, Subnet, Node SA, HNS Bucket & WIF IAM
+│   ├── gke.tf                                          # Zonal GKE Cluster (WIF + GCS FUSE CSI) + 4 Node Pools
+│   └── outputs.tf                                      # Cluster info, kubeconfig command & gcs_ai_bucket_name output
 └── k8s/                                                # LAYER 2: Operators, Kustomize & Labs
     ├── base/
     │   ├── kustomization.yaml                          # Unified entrypoint for base K8s resources
-    │   ├── namespaces.yaml                             # team-a & team-b (kueue-governance=enforced)
-    │   ├── pytorch-ddp-configmap.yaml                  # PyTorch DDP, Checkpointing & LWS TP scripts
+    │   ├── namespaces.yaml                             # team-a & team-b (kueue-governance=enforced) + lab10-gcsfuse-sa
+    │   ├── pytorch-ddp-configmap.yaml                  # PyTorch DDP, Checkpointing, LWS TP & GCS FUSE benchmark scripts
     │   ├── kueue-setup.yaml                            # Kueue v1beta2 Topology, Flavors, Cohort Queues, DWS
     │   └── governance-policy.yaml                      # CEL ValidatingAdmissionPolicy & Metrics RBAC
     └── labs/
@@ -194,5 +198,7 @@ gke-kueue-ai-workshop/
         ├── lab6-lws-inference-tas.yaml                 # Lab 6: LeaderWorkerSet Inference & Cross-PodSet TAS
         ├── lab7-checkpoint-resume.yaml                 # Lab 7: Stateful DDP Checkpointing & Preemption Resume
         ├── lab8-governance-and-max-exec.yaml           # Lab 8: CEL Admission Governance & Max-Exec-Time SLA
-        └── lab9-visibility-and-metrics.yaml            # Lab 9: Kueue Visibility API & Prometheus Metrics
+        ├── lab9-visibility-and-metrics.yaml            # Lab 9: Kueue Visibility API & Prometheus Metrics
+        └── lab10-gcsfuse-ai-storage.yaml               # Lab 10: GCS FUSE CSI, HNS, Per-Pod File Cache & Checkpoints
 ```
+

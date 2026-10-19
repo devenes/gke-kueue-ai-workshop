@@ -105,5 +105,5 @@ jobs:
       - name: Verify Makefile help and dry-run targets
         run: |
           make help
-          make -n lint preflight test-all lab1 lab2 lab3 lab4 lab5 lab6 lab7 lab8 lab9 labs-clean > /dev/null
+          make -n lint preflight test-all lab1 lab2 lab3 lab4 lab5 lab6 lab7 lab8 lab9 lab10 labs-clean > /dev/null
           echo "[PASS] All Makefile targets resolved cleanly."

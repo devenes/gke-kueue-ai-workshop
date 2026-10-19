@@ -128,7 +128,7 @@ else
 fi
 
 echo ""
-echo "4. Governance & ConfigMaps Check"
+echo "4. Governance, ServiceAccount & ConfigMaps Check"
 NSA_GOV=$(kubectl get ns team-a -o jsonpath='{.metadata.labels.kueue-governance}' 2>/dev/null || true)
 NSB_GOV=$(kubectl get ns team-b -o jsonpath='{.metadata.labels.kueue-governance}' 2>/dev/null || true)
 VAP=$(kubectl get validatingadmissionpolicy require-kueue-queue-name -o jsonpath='{.metadata.name}' 2>/dev/null || true)
@@ -143,10 +143,13 @@ CM1=$(kubectl get configmap pytorch-ddp-script -n team-a -o jsonpath='{.metadata
 CM2=$(kubectl get configmap pytorch-ddp-script -n team-b -o jsonpath='{.metadata.name}' 2>/dev/null || true)
 CM3=$(kubectl get configmap pytorch-lws-inference-script -n team-a -o jsonpath='{.metadata.name}' 2>/dev/null || true)
 CM4=$(kubectl get configmap pytorch-checkpoint-script -n team-a -o jsonpath='{.metadata.name}' 2>/dev/null || true)
-if [[ -n "$CM1" && -n "$CM2" && -n "$CM3" && -n "$CM4" ]]; then
-  pass "PyTorch ConfigMaps (pytorch-ddp-script, pytorch-lws-inference-script, pytorch-checkpoint-script) present"
+CM5=$(kubectl get configmap pytorch-gcsfuse-script -n team-a -o jsonpath='{.metadata.name}' 2>/dev/null || true)
+KSA10=$(kubectl get serviceaccount lab10-gcsfuse-sa -n team-a -o jsonpath='{.metadata.name}' 2>/dev/null || true)
+KSA10_GSA=$(kubectl get serviceaccount lab10-gcsfuse-sa -n team-a -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}' 2>/dev/null || true)
+if [[ -n "$CM1" && -n "$CM2" && -n "$CM3" && -n "$CM4" && -n "$CM5" && "$KSA10" == "lab10-gcsfuse-sa" && -z "$KSA10_GSA" ]]; then
+  pass "PyTorch ConfigMaps (ddp, lws-inference, checkpoint, gcsfuse) & direct-WIF KSA (lab10-gcsfuse-sa) present"
 else
-  fail "One or more PyTorch ConfigMaps missing"
+  fail "One or more PyTorch ConfigMaps or direct-WIF ServiceAccount (lab10-gcsfuse-sa) missing/misconfigured"
 fi
 
 echo ""
@@ -172,7 +175,44 @@ else
 fi
 
 echo ""
-echo "6. Clean State Check"
+echo "6. Cloud Storage FUSE CSI & HNS Bucket Check (Lab 10)"
+CSI_DRV=$(kubectl get csidriver gcsfuse.csi.storage.gke.io -o jsonpath='{.metadata.name}' 2>/dev/null || true)
+CSI_DS_DESIRED=$(kubectl get daemonset gcsfusecsi-node -n kube-system -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)
+CSI_DS_READY=$(kubectl get daemonset gcsfusecsi-node -n kube-system -o jsonpath='{.status.numberReady}' 2>/dev/null || true)
+if [[ "$CSI_DRV" == "gcsfuse.csi.storage.gke.io" && -n "$CSI_DS_READY" && "$CSI_DS_READY" == "$CSI_DS_DESIRED" && "$CSI_DS_READY" -ge 3 ]]; then
+  pass "GKE Cloud Storage FUSE CSI driver active ($CSI_DRV, gcsfusecsi-node Ready=$CSI_DS_READY/$CSI_DS_DESIRED)"
+else
+  fail "GKE Cloud Storage FUSE CSI driver not Ready (driver=$CSI_DRV, Ready=${CSI_DS_READY:-0}/${CSI_DS_DESIRED:-0})"
+fi
+
+TF_BUCKET=$(terraform -chdir=terraform output -raw gcs_ai_bucket_name 2>/dev/null || true)
+GCP_TOKEN=$(gcloud auth print-access-token 2>/dev/null || true)
+BUCKET_CHECK="FAIL:unresolved"
+if [[ -n "$TF_BUCKET" && "$TF_BUCKET" != *"Warning"* && -n "$GCP_TOKEN" ]]; then
+  BUCKET_CHECK=$(curl -fsSL -H "Authorization: Bearer $GCP_TOKEN" "https://storage.googleapis.com/storage/v1/b/${TF_BUCKET}" 2>/dev/null | python3 -c '
+import sys, json
+try:
+    b = json.load(sys.stdin)
+    bname = b.get("name", "")
+    hns = b.get("hierarchicalNamespace", {}).get("enabled", False)
+    ubla = b.get("iamConfiguration", {}).get("uniformBucketLevelAccess", {}).get("enabled", False)
+    loc = b.get("location", "")
+    if hns and ubla:
+        print(f"OK:gs://{bname} (location={loc}, HNS=True, UBLA=True)")
+    else:
+        print(f"FAIL:gs://{bname} (HNS={hns}, UBLA={ubla})")
+except Exception as e:
+    print(f"FAIL:{e}")
+' 2>/dev/null || echo "FAIL:api_error")
+fi
+if [[ "$BUCKET_CHECK" == OK:* ]]; then
+  pass "Terraform HNS Bucket verified (${BUCKET_CHECK#OK:})"
+else
+  fail "Terraform HNS Bucket check failed (${BUCKET_CHECK#FAIL:})"
+fi
+
+echo ""
+echo "7. Clean State Check"
 WORKLOAD_COUNT=$( { kubectl get jobsets,leaderworkersets,workloads -n team-a --no-headers 2>/dev/null; kubectl get jobsets,leaderworkersets,workloads -n team-b --no-headers 2>/dev/null; } | wc -l | tr -d ' ')
 if [[ "$WORKLOAD_COUNT" == "0" ]]; then
   pass "Zero stale JobSets, LeaderWorkerSets, or Workloads in team-a & team-b"
@@ -188,3 +228,4 @@ echo "==========================================================================
 if [[ "$FAIL_COUNT" -gt 0 ]]; then
   exit 1
 fi
+

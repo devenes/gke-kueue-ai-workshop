@@ -340,3 +340,406 @@ data:
 
     if __name__ == "__main__":
         main()
+---
+# ==============================================================================
+# 4. PyTorch Distributed GCS FUSE CSI + HNS + File Cache Benchmark (Lab 10)
+#    Verified Live on GKE v1.36.4-gke.1391002 (gcsfuse/3.11.2-gke.0):
+#    - Rank 0 128 MiB model staging write: 1393.19ms (Run 2) / 1828.48ms (Run 1)
+#    - Rank 0 HNS atomic directory rename: 136.04ms (Run 2) / 142.43ms (Run 1)
+#    - Pass 1 (Cold) -> Pass 2 (Warm) mmap=True + SHA-256 (b95e5d8f...5bdbe9):
+#      * Rank 0 (rack-1): 1190.60ms -> 252.48ms (4.72x) | Run 1: 1512.97ms -> 292.08ms (5.18x)
+#      * Rank 1 (rack-1): 1228.30ms -> 264.05ms (4.65x) | Run 1: 1784.02ms -> 248.48ms (7.18x)
+#      * Rank 2 (rack-2): 1161.93ms -> 242.16ms (4.80x) | Run 1: 1305.66ms -> 234.80ms (5.56x)
+#    - Cross-rank checkpoint shards (263,772 B x 3): 9/9 VALID across all ranks
+# ==============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pytorch-gcsfuse-script
+  namespace: team-a
+data:
+  gcsfuse_bench.py: |
+    import datetime
+    import hashlib
+    import json
+    import os
+    import socket
+    import sys
+    import time
+    import traceback
+    import uuid
+    import torch
+    import torch.distributed as dist
+
+    EXPECTED_TENSOR_COUNT = 8
+    EXPECTED_TENSOR_SHAPE = (2048, 2048)
+    EXPECTED_PAYLOAD_BYTES = 8 * 2048 * 2048 * 4  # 134,217,728 bytes (128 MiB)
+
+    def build_deterministic_model():
+        state_dict = {}
+        total_bytes = 0
+        for idx in range(EXPECTED_TENSOR_COUNT):
+            gen = torch.Generator(device="cpu")
+            gen.manual_seed(20261010 + idx)
+            tensor = torch.randn(EXPECTED_TENSOR_SHAPE, generator=gen, dtype=torch.float32)
+            state_dict[f"layer_{idx:02d}.weight"] = tensor
+            total_bytes += tensor.numel() * tensor.element_size()
+        if total_bytes != EXPECTED_PAYLOAD_BYTES:
+            raise RuntimeError(
+                f"Generated payload byte mismatch: expected {EXPECTED_PAYLOAD_BYTES}, got {total_bytes}"
+            )
+        return state_dict, total_bytes
+
+    def force_materialize_and_checksum(model_path):
+        t0 = time.perf_counter()
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(f"Published model file does not exist: {model_path}")
+
+        state = torch.load(
+            model_path,
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
+        if not isinstance(state, dict) or len(state) != EXPECTED_TENSOR_COUNT:
+            raise RuntimeError(
+                f"Invalid state_dict structure in {model_path}: count={len(state) if isinstance(state, dict) else 'N/A'}"
+            )
+
+        hasher = hashlib.sha256()
+        total_payload_bytes = 0
+        numeric_signature = 0.0
+
+        for key in sorted(state.keys()):
+            tensor = state[key]
+            if tuple(tensor.shape) != EXPECTED_TENSOR_SHAPE:
+                raise RuntimeError(f"Tensor {key} shape mismatch: {tuple(tensor.shape)} != {EXPECTED_TENSOR_SHAPE}")
+            if tensor.dtype != torch.float32:
+                raise RuntimeError(f"Tensor {key} dtype mismatch: {tensor.dtype} != torch.float32")
+
+            # Force materialization of every memory-mapped page by reducing all 4,194,304 floats in float64
+            tensor_sum = tensor.sum(dtype=torch.float64).item()
+            numeric_signature += tensor_sum
+            nbytes = tensor.numel() * tensor.element_size()
+            total_payload_bytes += nbytes
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        # Cryptographic SHA-256 digest over all 134,217,728 materialized tensor bytes
+        for key in sorted(state.keys()):
+            mv = memoryview(state[key].numpy()).cast("B")
+            hasher.update(mv)
+
+        if total_payload_bytes != EXPECTED_PAYLOAD_BYTES:
+            raise RuntimeError(
+                f"Materialized tensor payload mismatch: expected {EXPECTED_PAYLOAD_BYTES}, got {total_payload_bytes}"
+            )
+
+        return {
+            "elapsed_ms": elapsed_ms,
+            "tensor_payload_bytes": total_payload_bytes,
+            "numeric_signature": numeric_signature,
+            "sha256": hasher.hexdigest(),
+        }
+
+    def build_deterministic_shard_tensor(rank):
+        base = torch.arange(0, 65536, dtype=torch.float32).reshape(256, 256)
+        return base * 0.001 + float((rank + 1) * 100.0)
+
+    def hash_tensor_sha256(tensor):
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+        hasher = hashlib.sha256()
+        hasher.update(memoryview(tensor.numpy()).cast("B"))
+        return hasher.hexdigest()
+
+    def main():
+        torch.set_num_threads(1)
+        dist.init_process_group(
+            backend="gloo",
+            timeout=datetime.timedelta(seconds=180),
+        )
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        pod_name = os.environ.get("POD_NAME", socket.gethostname())
+        node_name = os.environ.get("NODE_NAME", socket.gethostname())
+        mount_path = os.environ.get("GCS_MOUNT_PATH", "/mnt/gcsfuse")
+
+        if world_size != 3:
+            raise RuntimeError(f"Lab 10 requires WORLD_SIZE=3, got {world_size}")
+        if not os.path.ismount(mount_path) and not os.path.isdir(mount_path):
+            raise RuntimeError(f"GCS FUSE mount path is not available: {mount_path}")
+
+        env_run_id = os.environ.get("RUN_ID", "").strip()
+        if rank == 0:
+            if not env_run_id or env_run_id.lower() == "auto":
+                ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+                run_id = f"run_{ts}_{uuid.uuid4().hex[:8]}"
+            else:
+                run_id = env_run_id
+        else:
+            run_id = ""
+
+        run_id_list = [run_id]
+        dist.broadcast_object_list(run_id_list, src=0)
+        run_id = run_id_list[0]
+
+        run_root = os.path.join(mount_path, "runs", run_id)
+        staging_dir = os.path.join(run_root, "staging_v1")
+        published_dir = os.path.join(run_root, "published_v1")
+        staging_model_path = os.path.join(staging_dir, "model.pt")
+        published_model_path = os.path.join(published_dir, "model.pt")
+        ckpt_dir = os.path.join(run_root, "checkpoints", "step_1")
+
+        print(
+            f"[INIT] rank={rank}/{world_size} pod={pod_name} node={node_name} "
+            f"run_id={run_id} mount_path={mount_path}",
+            flush=True,
+        )
+
+        # Phase 1: Rank 0 stages 128 MiB model and publishes via atomic HNS directory rename
+        rename_info = {"ok": False, "error": "", "rename_ms": 0.0, "serialized_bytes": 0}
+        if rank == 0:
+            try:
+                os.makedirs(staging_dir, exist_ok=True)
+                os.makedirs(ckpt_dir, exist_ok=True)
+                state_dict, payload_bytes = build_deterministic_model()
+                t_write0 = time.perf_counter()
+                with open(staging_model_path, "wb") as fh:
+                    torch.save(state_dict, fh)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                write_ms = (time.perf_counter() - t_write0) * 1000.0
+                serialized_bytes = os.path.getsize(staging_model_path)
+                if serialized_bytes < EXPECTED_PAYLOAD_BYTES:
+                    raise RuntimeError(
+                        f"Serialized file smaller than raw payload ({serialized_bytes} < {EXPECTED_PAYLOAD_BYTES})"
+                    )
+
+                t_ren0 = time.perf_counter()
+                os.rename(staging_dir, published_dir)
+                rename_ms = (time.perf_counter() - t_ren0) * 1000.0
+
+                staging_still_exists = os.path.exists(staging_dir)
+                published_dir_exists = os.path.isdir(published_dir)
+                published_file_exists = os.path.isfile(published_model_path)
+
+                if staging_still_exists or not published_dir_exists or not published_file_exists:
+                    raise RuntimeError(
+                        f"HNS directory rename verification failed: staging_exists={staging_still_exists} "
+                        f"published_dir_exists={published_dir_exists} published_file_exists={published_file_exists}"
+                    )
+
+                rename_info = {
+                    "ok": True,
+                    "error": "",
+                    "write_ms": round(write_ms, 2),
+                    "rename_ms": round(rename_ms, 2),
+                    "serialized_bytes": serialized_bytes,
+                    "tensor_payload_bytes": payload_bytes,
+                    "staging_exists_after_rename": staging_still_exists,
+                    "published_exists_after_rename": published_file_exists,
+                }
+                print(
+                    f"[HNS_RENAME] rank=0 pod={pod_name} node={node_name} "
+                    f"write_ms={write_ms:.2f} rename_ms={rename_ms:.2f} "
+                    f"staging_exists={staging_still_exists} published_exists={published_file_exists} "
+                    f"tensor_payload_bytes={payload_bytes} serialized_bytes={serialized_bytes}",
+                    flush=True,
+                )
+            except Exception as exc:
+                rename_info = {"ok": False, "error": f"{exc}\n{traceback.format_exc()}"}
+
+        rename_bcast = [rename_info]
+        dist.broadcast_object_list(rename_bcast, src=0)
+        rename_info = rename_bcast[0]
+        if not rename_info.get("ok"):
+            raise RuntimeError(f"Rank 0 failed model staging or HNS rename: {rename_info.get('error')}")
+
+        dist.barrier()
+
+        # Phase 2: Cold & Repeated (Warm) Read Benchmark with mmap=True and full page touch
+        cold_res = force_materialize_and_checksum(published_model_path)
+        warm_res = force_materialize_and_checksum(published_model_path)
+
+        if cold_res["sha256"] != warm_res["sha256"]:
+            raise RuntimeError(
+                f"Rank {rank} cold vs warm SHA-256 mismatch: {cold_res['sha256']} != {warm_res['sha256']}"
+            )
+        if abs(cold_res["numeric_signature"] - warm_res["numeric_signature"]) > 1e-5:
+            raise RuntimeError(
+                f"Rank {rank} cold vs warm numeric signature mismatch: "
+                f"{cold_res['numeric_signature']} != {warm_res['numeric_signature']}"
+            )
+
+        cold_ms = cold_res["elapsed_ms"]
+        warm_ms = warm_res["elapsed_ms"]
+        speedup = cold_ms / max(warm_ms, 0.001)
+
+        bench_record = {
+            "rank": rank,
+            "pod_name": pod_name,
+            "node_name": node_name,
+            "cold_ms": round(cold_ms, 2),
+            "warm_ms": round(warm_ms, 2),
+            "speedup": round(speedup, 2),
+            "tensor_payload_bytes": cold_res["tensor_payload_bytes"],
+            "numeric_signature": round(cold_res["numeric_signature"], 6),
+            "sha256": cold_res["sha256"],
+        }
+        print(
+            f"[CACHE_BENCH] rank={rank} pod={pod_name} node={node_name} "
+            f"cold_ms={cold_ms:.2f} warm_ms={warm_ms:.2f} speedup={speedup:.2f}x "
+            f"tensor_payload_bytes={cold_res['tensor_payload_bytes']} "
+            f"numeric_sig={cold_res['numeric_signature']:.6f} sha256={cold_res['sha256']}",
+            flush=True,
+        )
+
+        gathered_bench = [None for _ in range(world_size)]
+        dist.all_gather_object(gathered_bench, bench_record)
+
+        ref_sha256 = gathered_bench[0]["sha256"]
+        ref_sig = gathered_bench[0]["numeric_signature"]
+        for item in gathered_bench:
+            if item["tensor_payload_bytes"] != EXPECTED_PAYLOAD_BYTES:
+                raise RuntimeError(f"Rank {item['rank']} payload bytes != {EXPECTED_PAYLOAD_BYTES}: {item}")
+            if item["sha256"] != ref_sha256:
+                raise RuntimeError(
+                    f"Cross-rank model SHA-256 mismatch: rank 0={ref_sha256} vs rank {item['rank']}={item['sha256']}"
+                )
+            if abs(item["numeric_signature"] - ref_sig) > 1e-4:
+                raise RuntimeError(
+                    f"Cross-rank numeric signature mismatch: rank 0={ref_sig} vs rank {item['rank']}={item['numeric_signature']}"
+                )
+
+        print(
+            f"[MODEL_VERIFY] rank={rank} all_ranks_sha256_match=True "
+            f"sha256={ref_sha256} tensor_payload_bytes={EXPECTED_PAYLOAD_BYTES} verified_ranks={world_size}",
+            flush=True,
+        )
+
+        dist.barrier()
+
+        # Phase 3: Distributed Checkpoint Shards — Each rank writes rank_{r}.pt
+        shard_tensor = build_deterministic_shard_tensor(rank)
+        shard_sha256 = hash_tensor_sha256(shard_tensor)
+        shard_path = os.path.join(ckpt_dir, f"rank_{rank}.pt")
+        shard_payload = {
+            "rank": rank,
+            "world_size": world_size,
+            "run_id": run_id,
+            "step": 1,
+            "pod_name": pod_name,
+            "node_name": node_name,
+            "model_sha256": ref_sha256,
+            "shard_sha256": shard_sha256,
+            "shard_tensor": shard_tensor,
+        }
+
+        t_ckpt_w0 = time.perf_counter()
+        with open(shard_path, "wb") as fh:
+            torch.save(shard_payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        ckpt_write_ms = (time.perf_counter() - t_ckpt_w0) * 1000.0
+        shard_file_bytes = os.path.getsize(shard_path)
+
+        print(
+            f"[CKPT_WRITE] rank={rank} pod={pod_name} node={node_name} "
+            f"path={shard_path} bytes={shard_file_bytes} write_ms={ckpt_write_ms:.2f} shard_sha256={shard_sha256}",
+            flush=True,
+        )
+
+        # Synchronize so all 3 shards are flushed and closed before any rank reads peer shards
+        dist.barrier()
+
+        # Phase 4: Every rank independently reads and validates all 3 shards
+        verified_shards = []
+        for target_rank in range(world_size):
+            target_path = os.path.join(ckpt_dir, f"rank_{target_rank}.pt")
+            if not os.path.isfile(target_path):
+                raise FileNotFoundError(
+                    f"Rank {rank} could not find peer checkpoint shard for rank {target_rank} at {target_path}"
+                )
+            loaded = torch.load(target_path, map_location="cpu", weights_only=True)
+            if loaded.get("rank") != target_rank:
+                raise RuntimeError(f"Shard {target_path} rank mismatch: {loaded.get('rank')} != {target_rank}")
+            if loaded.get("run_id") != run_id:
+                raise RuntimeError(f"Shard {target_path} run_id mismatch: {loaded.get('run_id')} != {run_id}")
+            if loaded.get("model_sha256") != ref_sha256:
+                raise RuntimeError(f"Shard {target_path} model_sha256 mismatch")
+
+            expected_tensor = build_deterministic_shard_tensor(target_rank)
+            expected_sha = hash_tensor_sha256(expected_tensor)
+            actual_tensor = loaded["shard_tensor"]
+            actual_sha = hash_tensor_sha256(actual_tensor)
+
+            if actual_sha != expected_sha or actual_sha != loaded.get("shard_sha256"):
+                raise RuntimeError(
+                    f"Shard {target_path} integrity hash mismatch on reader rank {rank}: "
+                    f"actual={actual_sha} expected={expected_sha} recorded={loaded.get('shard_sha256')}"
+                )
+            if not torch.equal(actual_tensor, expected_tensor):
+                raise RuntimeError(f"Shard {target_path} tensor values do not match expected deterministic tensor")
+
+            verified_shards.append({
+                "reader_rank": rank,
+                "target_rank": target_rank,
+                "writer_node": loaded.get("node_name"),
+                "shard_sha256": actual_sha,
+            })
+            print(
+                f"[CKPT_READ_VERIFY] reader_rank={rank} reader_node={node_name} "
+                f"target_rank={target_rank} writer_node={loaded.get('node_name')} "
+                f"shard_sha256={actual_sha} status=VALID",
+                flush=True,
+            )
+
+        gathered_ckpt = [None for _ in range(world_size)]
+        dist.all_gather_object(gathered_ckpt, verified_shards)
+
+        total_verifications = sum(len(v) for v in gathered_ckpt if v)
+        if total_verifications != world_size * world_size:
+            raise RuntimeError(
+                f"Expected {world_size * world_size} cross-rank shard validations, got {total_verifications}"
+            )
+
+        unique_nodes = sorted({item["node_name"] for item in gathered_bench})
+        if len(unique_nodes) < 2:
+            raise RuntimeError(
+                f"Expected 3 workers to span across at least 2 nodes (2+1 placement), got nodes={unique_nodes}"
+            )
+
+        dist.barrier()
+
+        if rank == 0:
+            summary = {
+                "run_id": run_id,
+                "world_size": world_size,
+                "mount_path": mount_path,
+                "hns_rename": rename_info,
+                "model_tensor_payload_bytes": EXPECTED_PAYLOAD_BYTES,
+                "model_sha256": ref_sha256,
+                "unique_nodes": unique_nodes,
+                "ranks": gathered_bench,
+                "cross_rank_checkpoint_validations": total_verifications,
+            }
+            print(f"[LAB10_SUMMARY_JSON] {json.dumps(summary, sort_keys=True)}", flush=True)
+
+        print(
+            f"[LAB10_SUCCESS] rank={rank} pod={pod_name} node={node_name} "
+            f"run_id={run_id} model_sha256={ref_sha256} "
+            f"cross_rank_shards_verified={len(verified_shards)}/{world_size} "
+            f"cluster_nodes={','.join(unique_nodes)}",
+            flush=True,
+        )
+        if rank == 0:
+            print(
+                "Lab 10 GCS FUSE + HNS + File Cache + Distributed Checkpoint Benchmark Completed Successfully!",
+                flush=True,
+            )
+
+        dist.destroy_process_group()
+
+    if __name__ == "__main__":
+        main()

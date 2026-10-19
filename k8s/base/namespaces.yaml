@@ -11,3 +11,12 @@ metadata:
   name: team-b
   labels:
     kueue-governance: "enforced"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lab10-gcsfuse-sa
+  namespace: team-a
+  labels:
+    app: lab10-gcsfuse-bench
+    workshop.ai/lab: "lab10"

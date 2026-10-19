@@ -3,12 +3,18 @@ resource "google_project_service" "apis" {
   for_each = toset([
     "compute.googleapis.com",
     "container.googleapis.com",
-    "iam.googleapis.com"
+    "iam.googleapis.com",
+    "storage.googleapis.com"
   ])
 
   project            = var.project_id
   service            = each.key
   disable_on_destroy = false
+}
+
+data "google_project" "current" {
+  project_id = var.project_id
+  depends_on = [google_project_service.apis]
 }
 
 # 2. Workshop Custom VPC Network
@@ -51,3 +57,38 @@ resource "google_project_iam_member" "gke_nodes_default" {
   role    = "roles/container.defaultNodeServiceAccount"
   member  = "serviceAccount:${google_service_account.gke_nodes.email}"
 }
+
+# 5. Lab 10: Cloud Storage Bucket with Hierarchical Namespace (HNS) for AI Model Caching & Checkpointing
+resource "google_storage_bucket" "ai_storage" {
+  name                        = "${var.project_id}-kueue-ai-storage"
+  project                     = var.project_id
+  location                    = var.region
+  storage_class               = "STANDARD"
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  force_destroy               = false
+
+  hierarchical_namespace {
+    enabled = true
+  }
+
+  labels = {
+    "workshop"  = "gke-kueue-ai"
+    "component" = "lab10-gcsfuse-hns"
+    "managed"   = "terraform"
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+# 6. Direct Workload Identity Federation IAM Grant (Zero GSA Annotation Required)
+resource "google_storage_bucket_iam_member" "lab10_ksa_object_user" {
+  bucket = google_storage_bucket.ai_storage.name
+  role   = "roles/storage.objectUser"
+  member = "principal://iam.googleapis.com/projects/${data.google_project.current.number}/locations/global/workloadIdentityPools/${var.project_id}.svc.id.goog/subject/ns/team-a/sa/lab10-gcsfuse-sa"
+
+  depends_on = [
+    google_container_cluster.workshop
+  ]
+}
+

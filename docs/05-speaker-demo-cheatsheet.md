@@ -1,12 +1,12 @@
 # 05 — Speaker Demo Cheat Sheet & Live Presentation Runbook
 
-Use this **Two-Terminal Split-Screen Runbook** when delivering a live conference talk, customer workshop, or technical deep dive covering all 9 labs.
+Use this **Two-Terminal Split-Screen Runbook** when delivering a live conference talk, customer workshop, or technical deep dive covering all 10 labs.
 
 ---
 
 ## Pre-Talk Checklist (15 Minutes Before Going Live)
 
-Run these commands once before your session to verify the GKE cluster, operators, queues, CEL policies, observability endpoints, and image caches:
+Run these commands once before your session to verify the GKE cluster, operators, queues, CEL policies, observability endpoints, GCS FUSE CSI + HNS bucket, and image caches:
 
 ```bash
 # 1. Verify cluster credentials, operators, and Kueue base setup
@@ -15,10 +15,10 @@ make operators-install
 make base-apply
 make labs-clean
 
-# 2. Run the 15-second 14-point Pre-Flight Check (must show 14 PASSED, 0 FAILED)
+# 2. Run the 15-second 16-point Pre-Flight Check (must show 16 PASSED, 0 FAILED)
 make preflight
 
-# 3. (Optional Rehearsal) Run the full 9-lab automated E2E smoke test (~3.5 mins)
+# 3. (Optional Rehearsal) Run the full 10-lab automated E2E smoke test (~4.5 mins)
 make test-all
 ```
 
@@ -29,54 +29,61 @@ make test-all
 ================================================================================
 
 1. Cluster & Node Topology Check
-  [PASS] system-pool node Ready (gke-gke-kueue-workshop-system-pool-be3c118f-6cgc, workload=system)
-  [PASS] on-demand-rack-1 node Ready (gke-gke-kueue-worksh-on-demand-rack-1-37786744-3n48, block-1/rack-1)
-  [PASS] on-demand-rack-2 node Ready (gke-gke-kueue-worksh-on-demand-rack-2-c183e097-qm0n, block-1/rack-2)
-  [PASS] Free allocatable CPU >= 3000m per on-demand rack (rack-1=3450m/3920m, rack-2=3335m/3920m)
+  [PASS] system-pool node Ready (gke-gke-kueue-workshop-system-pool-5f865c4e-7w99, workload=system)
+  [PASS] on-demand-rack-1 node Ready (gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf, block-1/rack-1)
+  [PASS] on-demand-rack-2 node Ready (gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc, block-1/rack-2)
+  [PASS] Free allocatable CPU >= 3000m per on-demand rack (rack-1=3494m/3920m, rack-2=3335m/3920m)
 
 2. Operators & Webhooks Check
-  [PASS] jobset-system/jobset-controller Available=True (nodeSelector.workload=system, webhook=10.20.1.4)
-  [PASS] lws-system/lws-controller-manager Available=True (nodeSelector.workload=system, webhook=10.20.1.8)
-  [PASS] kueue-system/kueue-controller-manager Available=True (nodeSelector.workload=system, webhook=10.20.1.10)
+  [PASS] jobset-system/jobset-controller Available=True (nodeSelector.workload=system, webhook=10.20.0.4)
+  [PASS] lws-system/lws-controller-manager Available=True (nodeSelector.workload=system, webhook=10.20.0.5)
+  [PASS] kueue-system/kueue-controller-manager Available=True (nodeSelector.workload=system, webhook=10.20.0.8)
 
 3. Kueue v1beta2 Control Plane Check
   [PASS] Topology (gke-dc-topology), ResourceFlavors (on-demand/spot), & ProvisioningRequestConfig verified
   [PASS] AdmissionCheck, ClusterQueues (team-a-cq & team-b-cq in ai-org-cohort), & LocalQueues Active=True
 
-4. Governance & ConfigMaps Check
+4. Governance, ServiceAccount & ConfigMaps Check
   [PASS] CEL ValidatingAdmissionPolicy (require-kueue-queue-name) & namespace labels (kueue-governance=enforced) active
-  [PASS] PyTorch ConfigMaps (pytorch-ddp-script, pytorch-lws-inference-script, pytorch-checkpoint-script) present
+  [PASS] PyTorch ConfigMaps (ddp, lws-inference, checkpoint, gcsfuse) & direct-WIF KSA (lab10-gcsfuse-sa) present
 
 5. Observability Endpoints Check
   [PASS] Kueue Visibility API v1beta2 (/pendingworkloads -> PendingWorkloadsSummary) reachable
   [PASS] Kueue Prometheus metrics (:8443/metrics) reachable & exporting kueue_cluster_queue_nominal_quota
 
-6. Clean State Check
+6. Cloud Storage FUSE CSI & HNS Bucket Check (Lab 10)
+  [PASS] GKE Cloud Storage FUSE CSI driver active (gcsfuse.csi.storage.gke.io, gcsfusecsi-node Ready=6/6)
+  [PASS] Terraform HNS Bucket verified (gs://enes-turan-demo-kueue-ai-storage (location=EUROPE-WEST1, HNS=True, UBLA=True))
+
+7. Clean State Check
   [PASS] Zero stale JobSets, LeaderWorkerSets, or Workloads in team-a & team-b
 
 ================================================================================
- Summary: 14 PASSED, 0 FAILED
+ Summary: 16 PASSED, 0 FAILED
 ================================================================================
 ```
 
 ### Expected `make test-all` Summary Table
 ```text
+[19:20:42]   [PASS] Lab 10: GCS FUSE CSI, HNS & Distributed Caching (Kueue=3750m vs Effective=4530m (+780m), nodes={'gke-gke-kueue-worksh-on-demand-rack-1-c61b6249-dzdf': 2, 'gke-gke-kueue-worksh-on-demand-rack-2-baf4d2e8-w3mc': 1}, HNS_rename=136.04ms, r0_cold=1190.6ms/warm=252.48ms, cross_shards=9) (34s)
+
 ================================================================================
- GKE KUEUE AI WORKSHOP — 9-LAB SMOKE TEST SUMMARY (Total: 286s)
+ GKE KUEUE AI WORKSHOP — 10-LAB SMOKE TEST SUMMARY (Total: 231s)
 ================================================================================
 Lab Scenario                                         | Status | Duration
 --------------------------------------------------------------------------------
 Lab 1: All-or-Nothing Gang Scheduling                | PASS   | 9s      
-Lab 2: Topology Aware Scheduling (Same-Rack)         | PASS   | 9s      
-Lab 3: Spot Spillover & Atomic ProvisioningRequest   | PASS   | 95s     
+Lab 2: Topology Aware Scheduling (Same-Rack)         | PASS   | 8s      
+Lab 3: Spot Spillover & Atomic ProvisioningRequest   | PASS   | 8s      
 Lab 4: Intra-Queue Priority Preemption               | PASS   | 15s     
 Lab 5: Multi-Team Cohort Borrowing & Reclamation     | PASS   | 15s     
-Lab 6: LeaderWorkerSet Inference & Cross-PodSet TAS  | PASS   | 14s     
-Lab 7: Stateful DDP Checkpointing & Resume           | PASS   | 79s     
-Lab 8: CEL Admission Governance & Max-Exec-Time SLA  | PASS   | 32s     
-Lab 9: Visibility API & Prometheus Metrics           | PASS   | 17s     
+Lab 6: LeaderWorkerSet Inference & Cross-PodSet TAS  | PASS   | 15s     
+Lab 7: Stateful DDP Checkpointing & Resume           | PASS   | 77s     
+Lab 8: CEL Admission Governance & Max-Exec-Time SLA  | PASS   | 33s     
+Lab 9: Visibility API & Prometheus Metrics           | PASS   | 15s     
+Lab 10: GCS FUSE CSI, HNS & Distributed Caching      | PASS   | 34s     
 ================================================================================
- RESULT: 9/9 LABS PASSED (100%)
+ RESULT: 10/10 LABS PASSED (100%)
 ================================================================================
 ```
 
@@ -215,12 +222,25 @@ make labs-clean
 
 ---
 
+### Demo 10: Cloud Storage FUSE CSI, HNS Atomic Directory Rename & Per-Pod File Cache (3 mins)
+```bash
+make lab10
+make labs-clean
+```
+**Speaker Talking Points:**
+- *"Look at Step 10D: Kueue admits the 3-Pod JobSet based on the pre-webhook Pod template (`3 × 1250m = 3750m` CPU: `3000m` nominal + `750m` borrowed). When Kueue unsuspends the JobSet, GKE's mutating webhook injects `gke-gcsfuse-sidecar` (`250m`/`512Mi`) and `gke-gcsfuse-metadata-prefetch` (`10m`/`10Mi`), raising actual Pod requests to `4530m` CPU (`+780m` delta) with `2` Pods co-located on `rack-1` and `1` Pod on `rack-2`."*
+- *"In Step 10F, Rank 0 stages a `128 MiB` (`134,217,728` byte) PyTorch model in `staging_v1/model.pt` (`write_ms=1393.19–1828.48ms`) and executes an atomic HNS directory rename (`os.rename(staging_v1, published_v1)`) in `136.04–142.43ms`."*
+- *"Notice that even though Rank 0 and Rank 1 share the exact same physical node (`rack-1`), Rank 1's Pass 1 is still a cold read (`1228.30–1784.02ms`) because `gcsfuse.csi.storage.gke.io` mounts an isolated per-Pod `emptyDir` cache (`512Mi`) inside each Pod's sidecar—followed by a `4.65x–7.18x` warm-cache speedup (`234.80–292.08ms`) on Pass 2 and $3 \times 3 = 9$ cross-rank checkpoint shard validations!"*
+
+---
+
 ## Post-Talk Teardown
 
-Once your session concludes, clean up all Kubernetes workloads and destroy the GCP infrastructure:
+Once your session concludes, clean up all Kubernetes workloads (and optionally destroy the GCP infrastructure when the workshop is completely finished):
 
 ```bash
 make labs-clean
-make infra-down
-gcloud container clusters list --project=enes-turan-demo
+# Optional when tearing down the workshop environment:
+# make infra-down
 ```
+

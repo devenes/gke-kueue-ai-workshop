@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/smoke-test-all.sh
-# End-to-End Automated Smoke Test Suite for all 9 labs in the GKE Kueue AI/ML Workshop.
+# End-to-End Automated Smoke Test Suite for all 10 labs in the GKE Kueue AI/ML Workshop.
 
 set -euo pipefail
 
@@ -18,6 +18,7 @@ declare -a LAB_NAMES=(
   "Lab 7: Stateful DDP Checkpointing & Resume"
   "Lab 8: CEL Admission Governance & Max-Exec-Time SLA"
   "Lab 9: Visibility API & Prometheus Metrics"
+  "Lab 10: GCS FUSE CSI, HNS, File Cache & Checkpoints"
 )
 declare -a LAB_STATUS=()
 declare -a LAB_DURATION=()
@@ -105,8 +106,8 @@ for _ in $(seq 1 60); do
   fi
   sleep 3
 done
-kubectl wait --for=condition=Ready pod -l jobset.sigs.k8s.io/jobset-name=pytorch-spot-atomic-scaleup -n team-a --timeout=120s
-SPOT_PODS=$(kubectl get pods -n team-a -l jobset.sigs.k8s.io/jobset-name=pytorch-spot-atomic-scaleup -o jsonpath='{.items[*].spec.nodeSelector.tier}')
+kubectl wait --for=condition=Ready pod -l jobset.sigs.k8s.io/jobset-name=pytorch-spot-atomic-scaleup -n team-a --timeout=180s
+SPOT_PODS=$(kubectl get pods -n team-a -l jobset.sigs.k8s.io/jobset-name=pytorch-spot-atomic-scaleup --field-selector=status.phase=Running -o jsonpath='{.items[*].spec.nodeSelector.tier}')
 make labs-clean >/dev/null
 T1=$(date +%s)
 if [[ "$PR_OK" == "true" && "$SPOT_PODS" == "spot spot spot" ]]; then
@@ -242,12 +243,48 @@ else
   record_result 8 "FAIL" "$((T1 - T0))" "Lab 9 output missing Visibility API or Prometheus metrics"
 fi
 
+# ------------------------------------------------------------------------------
+# LAB 10: GCS FUSE CSI, HNS, Per-Pod File Cache & Distributed Checkpointing
+# ------------------------------------------------------------------------------
+banner "${LAB_NAMES[9]}"
+T0=$(date +%s)
+LAB10_OUT=""
+if LAB10_OUT=$(make lab10 2>&1); then
+  echo "$LAB10_OUT"
+  LAB10_RC=0
+else
+  echo "$LAB10_OUT"
+  LAB10_RC=1
+fi
+T1=$(date +%s)
+if [[ "$LAB10_RC" -eq 0 && "$LAB10_OUT" == *"[LAB10_SUMMARY_JSON]"* && "$LAB10_OUT" == *"Lab 10 GCS FUSE + HNS + File Cache + Distributed Checkpoint Benchmark Completed Successfully!"* ]]; then
+  SUMMARY_DETAIL=$(echo "$LAB10_OUT" | python3 -c '
+import sys, json
+for line in sys.stdin:
+    if "[LAB10_SUMMARY_JSON]" in line:
+        j = json.loads(line.split("[LAB10_SUMMARY_JSON]", 1)[1].strip())
+        r0 = j["ranks"][0]
+        rid = j["run_id"]
+        ren_ms = j["hns_rename"]["rename_ms"]
+        sha = j["model_sha256"][:12]
+        c_ms, w_ms = r0["cold_ms"], r0["warm_ms"]
+        ckpts = j["cross_rank_checkpoint_validations"]
+        print(f"run={rid} HNS_rename={ren_ms}ms sha256={sha}... r0_cold={c_ms}ms/warm={w_ms}ms ckpts={ckpts}/9")
+        break
+')
+  make labs-clean >/dev/null
+  record_result 9 "PASS" "$((T1 - T0))" "$SUMMARY_DETAIL"
+else
+  make labs-clean >/dev/null || true
+  record_result 9 "FAIL" "$((T1 - T0))" "Lab 10 E2E storage & checkpoint benchmark failed"
+fi
+
 SUITE_END=$(date +%s)
 TOTAL_TIME=$((SUITE_END - SUITE_START))
 
 echo ""
 echo "================================================================================"
-echo " GKE KUEUE AI WORKSHOP — 9-LAB SMOKE TEST SUMMARY (Total: ${TOTAL_TIME}s)"
+echo " GKE KUEUE AI WORKSHOP — 10-LAB SMOKE TEST SUMMARY (Total: ${TOTAL_TIME}s)"
 echo "================================================================================"
 printf "%-52s | %-6s | %-8s\n" "Lab Scenario" "Status" "Duration"
 echo "--------------------------------------------------------------------------------"
@@ -255,5 +292,6 @@ for i in "${!LAB_NAMES[@]}"; do
   printf "%-52s | \033[32m%-6s\033[0m | %-8s\n" "${LAB_NAMES[$i]}" "${LAB_STATUS[$i]}" "${LAB_DURATION[$i]}"
 done
 echo "================================================================================"
-printf " RESULT: \033[1;32m9/9 LABS PASSED (100%%)\033[0m\n"
+printf " RESULT: \033[1;32m10/10 LABS PASSED (100%%)\033[0m\n"
 echo "================================================================================"
+

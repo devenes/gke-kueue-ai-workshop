@@ -1,0 +1,134 @@
+# k8s/labs/lab10-gcsfuse-ai-storage.yaml
+# Lab 10: Cloud-Native AI Storage — GCS FUSE CSI, Hierarchical Namespace (HNS),
+# Per-Pod File Cache & Distributed Checkpointing on GKE with Kueue & JobSet.
+#
+# Architecture & Resource Accounting Summary (Verified on GKE Standard v1.36.4-gke.1391002):
+#   1. Direct Workload Identity Federation: ServiceAccount 'team-a/lab10-gcsfuse-sa' (zero GSA hop)
+#      bound to 'roles/storage.objectUser' on the regional HNS bucket ('__GCS_AI_BUCKET_NAME__').
+#   2. Kueue Admission vs. GKE Webhook Sidecar Delta:
+#      - Kueue Workload Reservation: 3 Pods x (1250m CPU, 1536Mi Mem) = 3750m CPU, 4608Mi Mem
+#        (3000m nominal + 750m borrowed from team-b-cq in ai-org-cohort).
+#      - Post-Webhook Effective Pod Requests: 3 Pods x (1510m CPU, 2058Mi Mem) = 4530m CPU, 6174Mi Mem
+#        (+780m CPU / +1566Mi Mem delta from gke-gcsfuse-sidecar [250m/512Mi] + metadata-prefetch [10m/10Mi]).
+#      - Rack Placement: 2 Pods on on-demand-rack-1 (3020m CPU) + 1 Pod on on-demand-rack-2 (1510m CPU).
+#   3. Live GKE Benchmark Results (run_id=run_20261019_202022_3334db8a, gcsfuse/3.11.2-gke.0):
+#      - Stage 128 MiB model (8x [2048,2048] float32 = 134,217,728B): write_ms=1393.19ms, serialized=134,220,352B
+#      - Atomic HNS Directory Rename (os.rename staging_v1 -> published_v1): rename_ms=136.04ms
+#      - Rank 0 (rack-1, co-located): cold_ms=1190.60ms -> warm_ms=252.48ms (4.72x speedup)
+#      - Rank 1 (rack-1, co-located): cold_ms=1228.30ms -> warm_ms=264.05ms (4.65x speedup, proves per-Pod cache)
+#      - Rank 2 (rack-2, sole pod):   cold_ms=1161.93ms -> warm_ms=242.16ms (4.80x speedup)
+#      - All 3 Ranks Verified: numeric_sig=8474.860089, sha256=b95e5d8f83f0084ac554a4b4bd45a2f70202dc6d9b296965d848f5c9c05bdbe9
+#      - Cross-Rank Distributed Checkpoints (rank_{0,1,2}.pt, 263,772B each): 9/9 cross-rank validations VALID.
+#
+# NOTE: '__GCS_AI_BUCKET_NAME__' is a project-independent placeholder resolved
+# dynamically at runtime by 'make lab10' from 'terraform -chdir=terraform output -raw gcs_ai_bucket_name'.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lab10-gcsfuse-sa
+  namespace: team-a
+  labels:
+    app: lab10-gcsfuse-bench
+    workshop.ai/lab: "lab10"
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: lab10-gcsfuse-ai-storage
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: team-a-queue
+    kueue.x-k8s.io/priority-class: high-prod-priority
+spec:
+  replicatedJobs:
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        parallelism: 3
+        completions: 3
+        template:
+          metadata:
+            labels:
+              app: lab10-gcsfuse-bench
+              workshop.ai/lab: "lab10"
+            annotations:
+              # TAS block preference + topologySpreadConstraints produces a 2+1 split across rack-1 and rack-2
+              kueue.x-k8s.io/podset-preferred-topology: "workshop.ai/topology-block"
+              # Trigger GKE Cloud Storage FUSE CSI webhook sidecar injection & explicit sidecar sizing
+              gke-gcsfuse/volumes: "true"
+              gke-gcsfuse/cpu-request: "250m"
+              gke-gcsfuse/memory-request: "512Mi"
+              gke-gcsfuse/ephemeral-storage-request: "1Gi"
+              gke-gcsfuse/ephemeral-storage-limit: "2Gi"
+              gke-gcsfuse/cpu-limit: "0"
+              gke-gcsfuse/memory-limit: "0"
+              gke-gcsfuse/metadata-prefetch-cpu-request: "10m"
+              gke-gcsfuse/metadata-prefetch-memory-request: "10Mi"
+              gke-gcsfuse/metadata-prefetch-ephemeral-storage-request: "10Mi"
+          spec:
+            serviceAccountName: lab10-gcsfuse-sa
+            terminationGracePeriodSeconds: 5
+            restartPolicy: Never
+            topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: workshop.ai/topology-rack
+              whenUnsatisfiable: DoNotSchedule
+              labelSelector:
+                matchLabels:
+                  app: lab10-gcsfuse-bench
+            containers:
+            - name: pytorch
+              image: pytorch/torchserve:0.12.0-cpu
+              command:
+              - bash
+              - -c
+              - |
+                exec torchrun \
+                  --nnodes=3 \
+                  --nproc_per_node=1 \
+                  --node_rank=$JOB_COMPLETION_INDEX \
+                  --master_addr=lab10-gcsfuse-ai-storage-workers-0-0.lab10-gcsfuse-ai-storage \
+                  --master_port=29500 \
+                  /workspace/gcsfuse_bench.py
+              env:
+              - name: POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              - name: NODE_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: spec.nodeName
+              - name: GCS_MOUNT_PATH
+                value: "/mnt/gcsfuse"
+              - name: RUN_ID
+                value: "auto"
+              resources:
+                requests:
+                  # 3 trainers x 1250m = 3750m declared to Kueue (3000m nominal + 750m borrowed from team-b-cq).
+                  # Post-webhook Pods add +250m (gke-gcsfuse-sidecar) + 10m (metadata-prefetch) = 1510m/Pod (4530m total).
+                  cpu: "1250m"
+                  memory: "1536Mi"
+              volumeMounts:
+              - name: script-vol
+                mountPath: /workspace
+              - name: gcs-fuse-csi-ephemeral
+                mountPath: /mnt/gcsfuse
+            volumes:
+            - name: script-vol
+              configMap:
+                name: pytorch-gcsfuse-script
+            - name: gcs-fuse-csi-ephemeral
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: "__GCS_AI_BUCKET_NAME__"
+                  fileCacheCapacity: "512Mi"
+                  fileCacheForRangeRead: "true"
+                  gcsfuseMetadataPrefetchOnMount: "true"
+                  metadataCacheTTLSeconds: "60"
+                  metadataStatCacheCapacity: "32Mi"
+                  metadataTypeCacheCapacity: "4Mi"
+                  skipCSIBucketAccessCheck: "true"
+                  mountOptions: "implicit-dirs,uid=1000,gid=1000,file-mode=0664,dir-mode=0775,file-cache:enable-parallel-downloads:true"
