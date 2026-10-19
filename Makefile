@@ -52,6 +52,15 @@ infra-up: ## Provision GCP VPC, IAM, GKE Cluster, 4 Node Pools, and HNS GCS Buck
 	terraform -chdir=terraform apply -auto-approve
 
 infra-down: ## Destroy all GCP & GKE infrastructure via Terraform
+	@python3 -c 'import json, subprocess, urllib.parse, urllib.request; \
+bucket = "$(PROJECT_ID)-kueue-ai-storage"; \
+token = subprocess.check_output(["gcloud", "auth", "print-access-token"], text=True).strip(); \
+headers = {"Authorization": f"Bearer {token}"}; \
+items = json.loads(urllib.request.urlopen(urllib.request.Request(f"https://storage.googleapis.com/storage/v1/b/{bucket}/o", headers=headers)).read().decode()).get("items", []); \
+[urllib.request.urlopen(urllib.request.Request(f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{urllib.parse.quote(o[\"name\"], safe=\"\")}", headers=headers, method="DELETE")).read() for o in items]; \
+folders = sorted(json.loads(urllib.request.urlopen(urllib.request.Request(f"https://storage.googleapis.com/storage/v1/b/{bucket}/folders", headers=headers)).read().decode()).get("items", []), key=lambda f: f["name"].count("/"), reverse=True); \
+[urllib.request.urlopen(urllib.request.Request(f"https://storage.googleapis.com/storage/v1/b/{bucket}/folders/{urllib.parse.quote(f[\"name\"].rstrip(\"/\"), safe=\"\")}", headers=headers, method="DELETE")).read() for f in folders]; \
+print(f"Cleaned {len(items)} objects and {len(folders)} HNS folders in gs://{bucket}")' 2>/dev/null || true
 	terraform -chdir=terraform destroy -auto-approve
 
 kubeconfig: ## Fetch GKE cluster credentials into local kubeconfig
