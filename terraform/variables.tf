@@ -1,7 +1,7 @@
 variable "project_id" {
   description = "GCP Project ID"
   type        = string
-  default     = "enes-turan-demo"
+  default     = "your-gcp-project-id"
 }
 
 variable "region" {

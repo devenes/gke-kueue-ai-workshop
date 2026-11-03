@@ -12,6 +12,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.4%20CPU%20(Gloo)-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![Terraform](https://img.shields.io/badge/Terraform-%3E%3D%201.6-844FBA?logo=terraform&logoColor=white)](https://www.terraform.io/)
 [![Cost](https://img.shields.io/badge/Cloud%20Cost-~%240.40%2Fhr%20(Zero%20GPU)-2EA44F)](#architecture-overview)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 [**Quickstart**](#quickstart) · [**Architecture**](#architecture-overview) · [**10 Hands-On Labs**](#10-hands-on-labs) · [**Documentation**](#documentation-index-docs) · [**Speaker Runbook**](docs/05-speaker-demo-cheatsheet.md)
 
@@ -99,8 +100,8 @@ See **[`docs/03-labs-step-by-step-guide.md`](docs/03-labs-step-by-step-guide.md)
 
 ```mermaid
 flowchart TB
-    subgraph GCP["GCP Project: enes-turan-demo (europe-west1 / europe-west1-b)"]
-        GCS["GCS Bucket (HNS + Uniform Access)\nenes-turan-demo-kueue-ai-storage\nDirect WIF IAM: roles/storage.objectUser"]
+    subgraph GCP["GCP Project: your-gcp-project-id (europe-west1 / europe-west1-b)"]
+        GCS["GCS Bucket (HNS + Uniform Access)\nyour-gcp-project-id-kueue-ai-storage\nDirect WIF IAM: roles/storage.objectUser"]
         subgraph GKE["GKE Standard Cluster: gke-kueue-workshop (WIF + GcsFuseCsiDriver)"]
             subgraph SYS["Node Pool: system-pool (1x e2-standard-2)"]
                 KUEUE["Kueue Operator (v0.16.2)\n+ Visibility API + Prometheus :8443"]
@@ -152,53 +153,4 @@ Start here for deep-dive architectural guides, capacity engineering math, live G
 | **[03 — Step-by-Step Labs Guide (Labs 1–10)](docs/03-labs-step-by-step-guide.md)** | Manifest breakdowns, Mermaid sequence diagrams, verification commands, and real terminal outputs from GKE Standard `v1.36` across all 10 labs. |
 | **[04 — Production Gotchas & Troubleshooting](docs/04-production-gotchas-and-troubleshooting.md)** | Thirteen critical engineering lessons from live GKE testing (`best-effort-atomic-scale-up.autoscaling.x-k8s.io`, TAS spillover rules, `v1beta2` `cohortName`, `JobSet` webhook immutability, LWS Cross-PodSet TAS `podset-group-name`, `reclaimWithinCohort`, PID 1 `exec torchrun` `SIGTERM` checkpointing, CEL governance, `enableClusterQueueResources` Prometheus scraping, GCS FUSE sidecar webhook tax, direct WIF IAM, and cross-Pod negative-cache prevention). |
 | **[05 — Speaker Demo Cheat Sheet](docs/05-speaker-demo-cheatsheet.md)** | Two-Terminal Split-Screen Runbook (`watch` observer + command driver) with speaker talking points for all 10 live demos. |
-
----
-
-## Repository Structure
-
-```text
-gke-kueue-ai-workshop/
-├── .github/
-│   └── workflows/
-│       └── ci.yml                                      # GitHub Actions CI (Terraform, Kustomize, kubeconform, AST, ShellCheck)
-├── .gitignore
-├── .yamllint.yaml                                      # YAML lint rules for K8s manifests & GitHub Actions
-├── LICENSE
-├── Makefile                                            # Self-documenting workflow orchestration (including `make lint` & `make lab10`)
-├── README.md                                           # Workshop overview, architecture & quickstart
-├── docs/                                               # Zero-to-advanced documentation suite
-│   ├── 01-concepts-and-architecture.md
-│   ├── 02-infrastructure-and-capacity-math.md
-│   ├── 03-labs-step-by-step-guide.md
-│   ├── 04-production-gotchas-and-troubleshooting.md
-│   └── 05-speaker-demo-cheatsheet.md
-├── scripts/                                            # Automated pre-flight & E2E verification suite
-│   ├── preflight-check.sh                              # 15-second 16-point cluster & HNS storage readiness check
-│   └── smoke-test-all.sh                               # Automated 10-lab end-to-end regression suite
-├── terraform/                                          # LAYER 1: Pure GCP Cloud Infrastructure
-│   ├── versions.tf                                     # hashicorp/google (~> 6.0) only
-│   ├── variables.tf                                    # Project, Region, Zone, Cluster variables
-│   ├── network_iam.tf                                  # GCP APIs, Custom VPC, Subnet, Node SA, HNS Bucket & WIF IAM
-│   ├── gke.tf                                          # Zonal GKE Cluster (WIF + GCS FUSE CSI) + 4 Node Pools
-│   └── outputs.tf                                      # Cluster info, kubeconfig command & gcs_ai_bucket_name output
-└── k8s/                                                # LAYER 2: Operators, Kustomize & Labs
-    ├── base/
-    │   ├── kustomization.yaml                          # Unified entrypoint for base K8s resources
-    │   ├── namespaces.yaml                             # team-a & team-b (kueue-governance=enforced) + lab10-gcsfuse-sa
-    │   ├── pytorch-ddp-configmap.yaml                  # PyTorch DDP, Checkpointing, LWS TP & GCS FUSE benchmark scripts
-    │   ├── kueue-setup.yaml                            # Kueue v1beta2 Topology, Flavors, Cohort Queues, DWS
-    │   └── governance-policy.yaml                      # CEL ValidatingAdmissionPolicy & Metrics RBAC
-    └── labs/
-        ├── lab1-gang-scheduling.yaml                   # Lab 1: All-or-Nothing Gang Admission
-        ├── lab2-tas-rack.yaml                          # Lab 2: Topology Aware Scheduling (Same Rack)
-        ├── lab3-spot-atomic.yaml                       # Lab 3: Spot Spillover & Atomic Scale-Up
-        ├── lab4-preemption.yaml                        # Lab 4: Intra-Queue Priority Preemption
-        ├── lab5-cohort-borrowing.yaml                  # Lab 5: Multi-Team Cohort Borrowing & Reclamation
-        ├── lab6-lws-inference-tas.yaml                 # Lab 6: LeaderWorkerSet Inference & Cross-PodSet TAS
-        ├── lab7-checkpoint-resume.yaml                 # Lab 7: Stateful DDP Checkpointing & Preemption Resume
-        ├── lab8-governance-and-max-exec.yaml           # Lab 8: CEL Admission Governance & Max-Exec-Time SLA
-        ├── lab9-visibility-and-metrics.yaml            # Lab 9: Kueue Visibility API & Prometheus Metrics
-        └── lab10-gcsfuse-ai-storage.yaml               # Lab 10: GCS FUSE CSI, HNS, Per-Pod File Cache & Checkpoints
-```
 

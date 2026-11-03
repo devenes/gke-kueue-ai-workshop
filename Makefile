@@ -1,4 +1,4 @@
-PROJECT_ID   ?= enes-turan-demo
+PROJECT_ID   ?= your-gcp-project-id
 REGION       ?= europe-west1
 ZONE         ?= europe-west1-b
 CLUSTER_NAME ?= gke-kueue-workshop

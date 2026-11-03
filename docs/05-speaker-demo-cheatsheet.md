@@ -53,7 +53,7 @@ make test-all
 
 6. Cloud Storage FUSE CSI & HNS Bucket Check (Lab 10)
   [PASS] GKE Cloud Storage FUSE CSI driver active (gcsfuse.csi.storage.gke.io, gcsfusecsi-node Ready=6/6)
-  [PASS] Terraform HNS Bucket verified (gs://enes-turan-demo-kueue-ai-storage (location=EUROPE-WEST1, HNS=True, UBLA=True))
+  [PASS] Terraform HNS Bucket verified (gs://your-gcp-project-id-kueue-ai-storage (location=EUROPE-WEST1, HNS=True, UBLA=True))
 
 7. Clean State Check
   [PASS] Zero stale JobSets, LeaderWorkerSets, or Workloads in team-a & team-b

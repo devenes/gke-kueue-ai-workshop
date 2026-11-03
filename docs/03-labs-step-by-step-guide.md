@@ -550,7 +550,7 @@ kueue_pending_workloads{cluster_queue="team-a-cq",replica_role="leader",status="
 
 ### 1. Scenario & Objective
 Production multi-node AI training and inference jobs on GKE use **Google Cloud Storage (GCS)** with **Hierarchical Namespace (HNS)** and the **Cloud Storage FUSE CSI driver (`gcsfuse.csi.storage.gke.io`)** to stage and load model weights and save distributed checkpoints without managing POSIX NFS/Filestore clusters.
-1. **Direct Workload Identity Federation (No GSA Hop):** `ServiceAccount/lab10-gcsfuse-sa` in `team-a` has no `iam.gke.io/gcp-service-account` annotation; Terraform binds `roles/storage.objectUser` on the regional HNS bucket directly to `principal://iam.googleapis.com/projects/697289276442/locations/global/workloadIdentityPools/enes-turan-demo.svc.id.goog/subject/ns/team-a/sa/lab10-gcsfuse-sa`.
+1. **Direct Workload Identity Federation (No GSA Hop):** `ServiceAccount/lab10-gcsfuse-sa` in `team-a` has no `iam.gke.io/gcp-service-account` annotation; Terraform binds `roles/storage.objectUser` on the regional HNS bucket directly to `principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/your-gcp-project-id.svc.id.goog/subject/ns/team-a/sa/lab10-gcsfuse-sa`.
 2. **Kueue Admission vs. Post-Webhook GKE Sidecar Accounting:** Kueue evaluates the 3-Pod `JobSet` before Pods exist (`3 × 1250m = 3750m` CPU, `3000m` nominal + `750m` borrowed from `team-b-cq`). When Kueue unsuspends the `JobSet`, GKE's GCS FUSE mutating webhook injects `gke-gcsfuse-sidecar` (`250m` CPU, `512Mi` memory) and `gke-gcsfuse-metadata-prefetch` (`10m` CPU, `10Mi` memory) native sidecars into each Pod, raising actual `kube-scheduler` Pod requests to `3 × 1510m = 4530m` CPU (`+780m` CPU delta). Two Pods co-locate on `on-demand-rack-1` (`3020m` CPU) and one Pod runs on `on-demand-rack-2` (`1510m` CPU).
 3. **Atomic HNS Directory Rename (`os.rename`):** Rank 0 writes an 8-tensor (`[2048, 2048]` `float32`, exact `134,217,728` bytes / `128 MiB` tensor payload) state dict into `/mnt/gcsfuse/runs/<run_id>/staging_v1/model.pt`, flushes/fsyncs, and executes `os.rename(staging_dir, published_dir)` — completing an atomic server-side HNS directory rename in `136.04 ms–142.43 ms`.
 4. **Per-Pod File Cache & `mmap=True` Verification:** All 3 ranks load `published_v1/model.pt` with `torch.load(..., map_location="cpu", weights_only=True, mmap=True)` and touch every single page (`134,217,728` bytes) across Pass 1 (cold read from GCS into per-Pod `/gcsfuse-cache`) and Pass 2 (warm read from local cache, achieving **`4.65x–7.18x` speedup**), proving that even co-located Pods on `rack-1` maintain isolated per-Pod file caches.
@@ -646,7 +646,7 @@ make labs-clean
 #### A. `make lab10` Complete Execution Output (`run_20261019_202022_3334db8a`)
 ```text
 === Step 10A: Resolving HNS Bucket Name from Terraform Output ===
-Resolved Terraform HNS Bucket: gs://enes-turan-demo-kueue-ai-storage (Project: enes-turan-demo)
+Resolved Terraform HNS Bucket: gs://your-gcp-project-id-kueue-ai-storage (Project: your-gcp-project-id)
 === Step 10B: Applying Rendered Lab 10 Manifest (ServiceAccount + 3-Rank JobSet) ===
 serviceaccount/lab10-gcsfuse-sa unchanged
 jobset.jobset.x-k8s.io/lab10-gcsfuse-ai-storage created
@@ -698,14 +698,14 @@ jobset.jobset.x-k8s.io/lab10-gcsfuse-ai-storage condition met
 {"severity":"INFO","message":"UserAgent = gcsfuse/3.11.2-gke.0 (Go version go1.26.5) (GPN:gcsfuse-gke-gcs-fuse-csi) (Cfg:1:1:1:1:0:0)"}
 {"severity":"INFO","message":"File Cache: Regular cache size: 512 MB (536870912 bytes)"}
 {"severity":"INFO","message":"MRD cache (LRU-based) enabled with maxSize=1000 (pools closed-file MRDs)"}
-{"severity":"INFO","message":"Calling GetStorageLayout for \"projects/_/buckets/enes-turan-demo-kueue-ai-storage/storageLayout\": Attempt: 1, with deadline=30s"}
-{"severity":"INFO","message":"GetStorageLayout -> (enes-turan-demo-kueue-ai-storage) 363 msec"}
+{"severity":"INFO","message":"Calling GetStorageLayout for \"projects/_/buckets/your-gcp-project-id-kueue-ai-storage/storageLayout\": Attempt: 1, with deadline=30s"}
+{"severity":"INFO","message":"GetStorageLayout -> (your-gcp-project-id-kueue-ai-storage) 363 msec"}
 {"severity":"INFO","message":"GCSFuse Config","Applied optimizations for bucket-type: ":"hierarchical","Full Config":{"file-system.congestion-threshold":{"final_value":9,"optimization_reason":"bucket-type \"hierarchical\""},"file-system.fuse-max-request-size-kb":{"final_value":16384,"optimization_reason":"bucket-type \"hierarchical\""},"file-system.max-background":{"final_value":12,"optimization_reason":"bucket-type \"hierarchical\""},"file-system.max-read-ahead-kb":{"final_value":131072,"optimization_reason":"bucket-type \"hierarchical\""}}}
-{"severity":"INFO","message":"Mounting file system \"enes-turan-demo-kueue-ai-storage\"..."}
+{"severity":"INFO","message":"Mounting file system \"your-gcp-project-id-kueue-ai-storage\"..."}
 {"severity":"INFO","message":"File system has been successfully mounted."}
 ```
 
-#### C. Verified GCS HNS Bucket Objects (`gs://enes-turan-demo-kueue-ai-storage`)
+#### C. Verified GCS HNS Bucket Objects (`gs://your-gcp-project-id-kueue-ai-storage`)
 ```text
 runs/run_20261019_202022_3334db8a/published_v1/model.pt        134220352 bytes
 runs/run_20261019_202022_3334db8a/checkpoints/step_1/rank_0.pt    263772 bytes
